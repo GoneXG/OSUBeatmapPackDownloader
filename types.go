@@ -42,21 +42,6 @@ type CategoryChoice struct {
 	Mode  string // 无子模式时为空
 }
 
-// SaveStyle 下载保存方式。
-type SaveStyle int
-
-const (
-	SaveStyleAutoDir SaveStyle = 1 // 按 类型_模式 自动分目录
-	SaveStyleCustom  SaveStyle = 2 // 统一保存到用户指定路径
-)
-
-// Cookie 登录 Cookie 采集结果。
-type Cookie struct {
-	Value  string // osu_sid 的值（可能为空）
-	Source string // auto / manual / skipped
-	Note   string
-}
-
 // ScrapeResult 抓取一整个列表类型的结果。
 type ScrapeResult struct {
 	Packs  []Pack

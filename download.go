@@ -10,19 +10,9 @@ import (
 	"strings"
 )
 
-// ResolveTargetDir 根据保存方式返回下载目标目录（自动分目录或统一路径）。
-func ResolveTargetDir(style SaveStyle, cat Category, mode, customDir string) (string, error) {
-	var target string
-	if style == SaveStyleCustom {
-		target = customDir
-	} else {
-		label := cat.Name
-		if mode != "" {
-			label = cat.Name + "_" + mode
-		}
-		target = filepath.Join(DownloadRoot, SanitizeName(label))
-	}
-	abs, err := AbsOrRelJoin(target)
+// ResolveDownloadDir 返回下载目标目录：所有文件直接混存到下载根目录。
+func ResolveDownloadDir() (string, error) {
+	abs, err := AbsOrRelJoin(DownloadRoot)
 	if err != nil {
 		return "", err
 	}
