@@ -10,3 +10,6 @@ tools/
 # 编辑器
 .idea/
 .vscode/
+
+# 本地工具索引
+.codegraph/
