@@ -1,0 +1,12 @@
+# 程序产物
+*.exe
+*.test
+
+# 运行输出
+URL/
+download/
+tools/
+
+# 编辑器
+.idea/
+.vscode/
