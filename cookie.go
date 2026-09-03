@@ -12,7 +12,8 @@ func ManualCookieInput() (string, bool) {
 	fmt.Println("1. 用浏览器打开 https://osu.ppy.sh/home 并登录账号；")
 	fmt.Println("2. 按 F12 打开开发者工具 -> Application/Cookie -> https://osu.ppy.sh；")
 	fmt.Println("3. 找到名为 osu_sid 的条目，复制它的 Value；")
-	fmt.Println("4. 回到本程序粘贴后回车。直接回车 = 跳过（放弃重试）。")
+	fmt.Println("4. 回到本程序粘贴后回车（只粘贴 Value 即可；整段 osu_sid=xxx 也能自动解析）。")
+	fmt.Println("   直接回车 = 跳过（放弃重试）。")
 	fmt.Print("osu_sid 值: ")
 	line, err := stdinReader.ReadString('\n')
 	if err != nil {

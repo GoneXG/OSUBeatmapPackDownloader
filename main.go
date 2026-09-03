@@ -33,8 +33,8 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	// ---------- T1 初始化目录 ----------
-	msgf("[T1] 初始化目录 %s 与 %s ...", UrlOutputDir, DownloadRoot)
+	// ---------- 初始化目录 ----------
+	msgf("正在初始化目录 %s 与 %s ...", UrlOutputDir, DownloadRoot)
 	if err := EnsureDir(UrlOutputDir); err != nil {
 		return fmt.Errorf("无法创建 %s: %w", UrlOutputDir, err)
 	}
@@ -42,26 +42,26 @@ func run() error {
 		return fmt.Errorf("无法创建 %s: %w", DownloadRoot, err)
 	}
 
-	// ---------- T2 选择分类（子分类菜单支持返回上级） ----------
+	// ---------- 选择分类（子分类菜单支持返回上级） ----------
 	choice, err := pickCategory()
 	if err != nil {
 		return err
 	}
 	cat := CategoryMap[choice.CatID]
-	msgf("[T2] 已选择: %s%s", cat.Name, modeSuffix(choice.Mode))
+	msgf("已选择: %s%s", cat.Name, modeSuffix(choice.Mode))
 
-	// ---------- T4 构造列表页 URL ----------
+	// ---------- 构造列表页 URL ----------
 	pageURL, err := BuildURL(choice.CatID, choice.Mode)
 	if err != nil {
-		return fmt.Errorf("[T4] %w", err)
+		return err
 	}
 	if !ValidatePageURL(pageURL) {
-		return fmt.Errorf("[T4] 生成的 URL 非法: %s", pageURL)
+		return fmt.Errorf("生成的列表页 URL 非法: %s", pageURL)
 	}
-	msgf("[T4] 列表页: %s", pageURL)
+	msgf("列表页: %s", pageURL)
 
-	// ---------- T5 抓取链接：先无 Cookie 直连，失败再手动粘贴 Cookie 重爬 ----------
-	msgf("[T5] 先尝试无 Cookie 直连抓取（分页自动翻页，Ctrl+C 可中止）...")
+	// ---------- 抓取链接：先无 Cookie 直连，失败再手动粘贴 Cookie 重爬 ----------
+	msgf("正在抓取链接，先尝试无 Cookie 直连（分页自动翻页，Ctrl+C 可中止）...")
 	cookie := ""
 	scrape := ScrapeLinks(ctx, choice.CatID, choice.Mode, "")
 	if scrape.Failed && ctx.Err() == nil {
@@ -86,8 +86,8 @@ func run() error {
 	var scrapeFailedReason string
 	if scrape.Failed {
 		scrapeFailedReason = scrape.Reason
-		msgf("      [WARN] 抓取失败: %s", scrapeFailedReason)
-		msgf("      [Skip] 本次未生成下载列表。")
+		msgf("      抓取失败: %s", scrapeFailedReason)
+		msgf("      跳过：本次未生成下载列表。")
 		if err := writeScrapeFailure(); err != nil {
 			return err
 		}
@@ -95,12 +95,23 @@ func run() error {
 		return nil
 	}
 	packs := scrape.Packs
-	msgf("[T5] 抓取完成，共 %d 个曲包。", len(packs))
+	msgf("抓取完成，共 %d 个曲包。", len(packs))
 	if ctx.Err() != nil {
 		return fmt.Errorf("用户中断（Ctrl+C），本次任务中止")
 	}
 
-	// ---------- T6 写入 urls.txt ----------
+	// ---------- 选定曲包区间（仅常规分类下生效；按 tag 编号/最新数量筛选） ----------
+	if choice.CatID == 1 {
+		packs, err = askPackRange(packs)
+		if err != nil {
+			return err
+		}
+		if len(packs) == 0 {
+			return fmt.Errorf("区间内没有匹配的曲包")
+		}
+	}
+
+	// ---------- 写入 urls.txt ----------
 	var links []string
 	items := make([]aria2Item, 0, len(packs))
 	for _, p := range packs {
@@ -109,16 +120,16 @@ func run() error {
 	}
 	urlsPath := filepath.Join(UrlOutputDir, "urls.txt")
 	if err := WriteLines(urlsPath, links); err != nil {
-		return fmt.Errorf("[T6] 写入 %s 失败: %w", urlsPath, err)
+		return fmt.Errorf("写入 %s 失败: %w", urlsPath, err)
 	}
 	if fi, err := os.Stat(urlsPath); err != nil || fi.Size() <= 10 {
-		return fmt.Errorf("[T6] urls.txt 内容过小，疑似无有效链接")
+		return fmt.Errorf("%s 内容过小，疑似无有效链接", urlsPath)
 	}
-	msgf("[T6] 已写入 %s（%d 行, %d 字节）", urlsPath, len(links), fileSize(urlsPath))
+	msgf("已写入 %s（%d 行, %d 字节）", urlsPath, len(links), fileSize(urlsPath))
 
-	// ---------- T7 选择下载方式 ----------
+	// ---------- 选择下载方式 ----------
 	method := AskUser(
-		"[T7] 请选择下载方式: [1] 调用 aria2 下载  [2] 仅保留链接文件",
+		"请选择下载方式: [1] 调用 aria2 下载  [2] 仅保留链接文件",
 		map[string]bool{"1": true, "2": true},
 		3,
 		"2",
@@ -130,15 +141,15 @@ func run() error {
 		return nil
 	}
 
-	// ---------- T8 检查 aria2 ----------
+	// ---------- 检查 aria2 ----------
 	aria2Path, err := CheckAria2()
 	if err != nil {
-		msgf("[T8] %v", err)
-		msgf("      [降级] 未找到 aria2c，自动转为选项 2：仅保留链接文件。")
+		msgf("%v", err)
+		msgf("      未找到 aria2c，自动转为仅保留链接文件。")
 		msgf("      提示: 将 aria2c.exe 放入 %s 目录后重跑即可下载。", ToolsDir)
 		return nil
 	}
-	msgf("[T8] aria2c: %s", aria2Path)
+	msgf("aria2c: %s", aria2Path)
 
 	// ---------- 下载目标：全部混存到下载根目录 ----------
 	targetDir, err := ResolveDownloadDir()
@@ -147,15 +158,15 @@ func run() error {
 	}
 	msgf("      下载目标目录（混存）: %s", targetDir)
 
-	// ---------- T9 执行下载 ----------
-	msgf("[T9] 开始下载 %d 个曲包（自动重试一次官方存储地址）...", len(items))
+	// ---------- 执行下载 ----------
+	msgf("开始下载 %d 个曲包（自动重试一次官方存储地址）...", len(items))
 	failedItems := ExecuteDownload(ctx, aria2Path, targetDir, cookie, items)
 	if ctx.Err() != nil {
 		SaveFailedLog(failedItems, "")
 		return fmt.Errorf("下载被中断（Ctrl+C）：已把 %d 个未完成曲包记入 failed.txt", len(failedItems))
 	}
 
-	// ---------- T10 保存失败日志 ----------
+	// ---------- 保存失败日志 ----------
 	SaveFailedLog(failedItems, scrapeFailedReason)
 
 	// ---------- 端到端验收 ----------
@@ -172,7 +183,7 @@ func pickCategory() (CategoryChoice, error) {
 	for {
 		idx, err := ShowMenu("请选择曲包分类:", catNames)
 		if err != nil {
-			return CategoryChoice{}, fmt.Errorf("[T2] %w", err)
+			return CategoryChoice{}, err
 		}
 		catID := idx + 1
 		cat := CategoryMap[catID]
@@ -183,12 +194,49 @@ func pickCategory() (CategoryChoice, error) {
 		modeItems := append(append([]string{}, cat.Modes...), backOption)
 		modeIdx, err := ShowMenu(fmt.Sprintf("分类「%s」- 请选择游戏模式:", cat.Name), modeItems)
 		if err != nil {
-			return CategoryChoice{}, fmt.Errorf("[T2] %w", err)
+			return CategoryChoice{}, err
 		}
 		if modeIdx == len(cat.Modes) {
 			continue // 返回上级：重新选择分类
 		}
 		return CategoryChoice{CatID: catID, Mode: cat.Modes[modeIdx]}, nil
+	}
+}
+
+// askPackRange 抓取完成后询问是否限定曲包区间（仅常规分类使用），返回筛选后的列表。
+// 编号指曲包 tag 中的数字部分，例如 osu!mania 的 SM90-SM168 请输入 90-168。
+func askPackRange(packs []Pack) ([]Pack, error) {
+	if len(packs) == 0 {
+		return packs, nil
+	}
+	loN, hiN := numberExtent(packs)
+	for {
+		fmt.Printf("\n当前共有 %d 个曲包（编号范围 %d ~ %d），可限定区间：\n", len(packs), loN, hiN)
+		fmt.Println("  （编号指曲包 tag 里的数字，如 SM90-SM168 请输入 90-168）")
+		fmt.Println("  直接回车      = 全部保留")
+		fmt.Println("  输入 100-500  = 只保留编号 100 到 500")
+		fmt.Println("  输入 -300     = 只保留编号 <= 300")
+		fmt.Println("  输入 800-     = 只保留编号 >= 800")
+		fmt.Println("  输入 最新50   = 只保留最新的 50 个（也可输入 last50）")
+		fmt.Print("请输入区间: ")
+		line, err := stdinReader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("读取输入失败: %w", err)
+		}
+		sel, ok := parsePackSelector(line)
+		if !ok {
+			fmt.Println("无法识别该输入，请参考上方示例重新输入。")
+			continue
+		}
+		filtered := applyPackSelector(packs, sel)
+		if len(filtered) == 0 {
+			fmt.Println("该区间内没有匹配的曲包，请重新输入。")
+			continue
+		}
+		if len(filtered) != len(packs) {
+			msgf("已按区间筛选，保留 %d 个曲包。", len(filtered))
+		}
+		return filtered, nil
 	}
 }
 
@@ -226,9 +274,12 @@ func e2eCheck(targetDir string, total, failed int) error {
 	if expected < 0 {
 		expected = 0
 	}
-	if done >= expected {
+	if done >= expected && !(expected == 0 && total > 0) {
 		msgf("PASS")
 		return nil
+	}
+	if total > 0 && done == 0 {
+		msgf("注意: 没有任何曲包下载成功，请查看上方失败原因与 failed.txt。")
 	}
 	msgf("FAIL: 部分文件缺失（目标目录: %s）", targetDir)
 	msgf("      失败明细已写入 %s", filepath.Join(UrlOutputDir, "failed.txt"))

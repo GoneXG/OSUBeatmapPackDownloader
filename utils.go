@@ -6,7 +6,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 )
+
+var printMu sync.Mutex
 
 var invalidNameChars = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
 
@@ -49,5 +52,7 @@ func AbsOrRelJoin(p string) (string, error) {
 
 // msgf 向控制台打印带步骤前缀的信息。
 func msgf(format string, args ...any) {
+	printMu.Lock()
+	defer printMu.Unlock()
 	fmt.Printf(format+"\n", args...)
 }
