@@ -104,7 +104,7 @@ func ExecuteDownload(ctx context.Context, aria2Path, targetDir, cookie string, i
 		}
 
 		if badCookie {
-			msgf("      Cookie 未生效：页面仍提示需要登录。请确认复制的是 osu_sid 的 Value（第 %d/3 次）。", attempt)
+			msgf("      Cookie 未生效：页面仍提示需要登录。请确认复制的是 osu_session 的 Value 或整段 Cookie（第 %d/3 次）。", attempt)
 			cookie = ""
 			continue
 		}
@@ -140,12 +140,20 @@ func runAria2Pass(ctx context.Context, aria2Path, targetDir, cookie string, item
 		return items
 	}
 
+	// 并发策略：同时最多下载 8 个文件；批内文件少于 8 个时单文件 16 片并发，
+	// 达到 8 个及以上时单文件降为 10 片，避免连接数过多。
+	maxConcurrent := 8
+	split := 10
+	if len(items) < 8 {
+		split = 16
+	}
+
 	args := []string{
 		"--input-file=" + inputPath,
 		"--dir=" + targetDir,
-		"--max-concurrent-downloads=8",
-		"--split=4",
-		"--max-connection-per-server=4",
+		fmt.Sprintf("--max-concurrent-downloads=%d", maxConcurrent),
+		fmt.Sprintf("--split=%d", split),
+		fmt.Sprintf("--max-connection-per-server=%d", split),
 		"--continue=true",
 		"--auto-file-renaming=false",
 		"--allow-overwrite=false",
@@ -154,7 +162,7 @@ func runAria2Pass(ctx context.Context, aria2Path, targetDir, cookie string, item
 		"--console-log-level=notice",
 	}
 	if cookie != "" {
-		args = append(args, "--header=Cookie: osu_sid="+cookie)
+		args = append(args, "--header=Cookie: "+cookie)
 	}
 
 	msgf("      启动 aria2: %d 个任务 -> %s", len(items), targetDir)

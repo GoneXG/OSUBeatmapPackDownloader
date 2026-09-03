@@ -59,7 +59,7 @@ func PackDirectURL(p Pack) string {
 
 // HTTPGetWithCookie 携带 Cookie 抓取页面（T5 底层函数）。
 // 返回 (页面字节, 状态码, 错误)。状态码 >=400 不视为错误，由调用方决定。
-func HTTPGetWithCookie(ctx context.Context, pageURL, cookie string) ([]byte, int, error) {
+func HTTPGetWithCookie(ctx context.Context, pageURL, cookieHeader string) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 	if err != nil {
 		return nil, 0, err
@@ -67,8 +67,8 @@ func HTTPGetWithCookie(ctx context.Context, pageURL, cookie string) ([]byte, int
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-	if cookie != "" {
-		req.Header.Set("Cookie", "osu_sid="+cookie)
+	if cookieHeader != "" {
+		req.Header.Set("Cookie", cookieHeader)
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}

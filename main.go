@@ -66,7 +66,7 @@ func run() error {
 	scrape := ScrapeLinks(ctx, choice.CatID, choice.Mode, "")
 	if scrape.Failed && ctx.Err() == nil {
 		msgf("      直连抓取失败: %s", scrape.Reason)
-		msgf("      将改为手动粘贴 osu_sid Cookie 后重新爬取真实链接。")
+		msgf("      将改为手动粘贴 osu_session Cookie 后重新爬取真实链接。")
 		for attempt := 1; attempt <= 3; attempt++ {
 			val, skip := ManualCookieInput()
 			if skip {
