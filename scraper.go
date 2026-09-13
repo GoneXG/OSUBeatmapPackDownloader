@@ -3,17 +3,49 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/html"
 )
+
+// maxFetchAttempts 单次请求的最大尝试次数（含首次）。
+const maxFetchAttempts = 3
+
+// proxyURL 由 -proxy 启动参数设置；为空时使用系统/环境变量代理。
+var proxyURL string
+
+var (
+	clientOnce   sync.Once
+	cachedClient *http.Client
+)
+
+// getHTTPClient 返回全局复用的 HTTP 客户端（支持显式代理与系统代理，复用连接）。
+func getHTTPClient() *http.Client {
+	clientOnce.Do(func() {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.Proxy = http.ProxyFromEnvironment
+		if p := strings.TrimSpace(proxyURL); p != "" {
+			if u, err := url.Parse(p); err == nil && u.Host != "" {
+				transport.Proxy = http.ProxyURL(u)
+				msgf("已启用代理: %s", u.String())
+			} else {
+				msgf("警告: 代理地址 %q 无法解析，将按系统默认方式联网。", p)
+			}
+		}
+		cachedClient = &http.Client{Timeout: 30 * time.Second, Transport: transport}
+	})
+	return cachedClient
+}
 
 // BuildURL 根据分类与模式拼接曲包列表页 URL（T4）。
 // mode 不影响列表页地址（模式通过 tag/名称过滤），这里仅校验参数合法性。
@@ -71,8 +103,7 @@ func HTTPGetWithCookie(ctx context.Context, pageURL, cookieHeader string) ([]byt
 		req.Header.Set("Cookie", cookieHeader)
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := getHTTPClient().Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -85,23 +116,34 @@ func HTTPGetWithCookie(ctx context.Context, pageURL, cookieHeader string) ([]byt
 }
 
 // fetchPageWithRetry 对一次 GET 做最多 3 次重试（仅网络错误/5xx/403 时）。
+// 每次重试前都会打印提示，避免长时间无输出让人误以为程序卡死。
 func fetchPageWithRetry(ctx context.Context, pageURL, cookie string) ([]byte, int, error) {
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
+	lastStatus := 0
+	for attempt := 1; attempt <= maxFetchAttempts; attempt++ {
 		body, status, err := HTTPGetWithCookie(ctx, pageURL, cookie)
 		if err != nil {
-			lastErr = err
+			lastErr, lastStatus = err, 0
 		} else if status == 200 {
 			return body, status, nil
 		} else {
-			lastErr = fmt.Errorf("HTTP %d", status)
+			lastErr, lastStatus = fmt.Errorf("HTTP %d", status), status
 			if status != 403 && status < 500 {
 				return body, status, lastErr
 			}
 		}
-		time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		if attempt == maxFetchAttempts || ctx.Err() != nil {
+			break
+		}
+		wait := time.Duration(attempt) * 2 * time.Second
+		msgf("        请求失败（%s），%s 后重试（第 %d/%d 次）...", briefError(lastErr), wait, attempt+1, maxFetchAttempts)
+		select {
+		case <-ctx.Done():
+			return nil, lastStatus, lastErr
+		case <-time.After(wait):
+		}
 	}
-	return nil, 0, lastErr
+	return nil, lastStatus, lastErr
 }
 
 // ScrapeLinks 抓取一个分类（分页）下所有曲包并做模式过滤（T5）。
@@ -114,6 +156,8 @@ func ScrapeLinks(ctx context.Context, catID int, mode, cookie string) ScrapeResu
 	seen := map[string]bool{}
 	var packs []Pack
 	failReason := ""
+	needsCookie := false
+	networkError := false
 
 	for pageNo := 1; pageNo <= 1000; pageNo++ {
 		u := baseURL
@@ -126,15 +170,27 @@ func ScrapeLinks(ctx context.Context, catID int, mode, cookie string) ScrapeResu
 				// 已翻到最后一页之后。
 				break
 			}
-			failReason = fmt.Sprintf("抓取 %s 失败: %v", u, err)
-			if status == 403 {
+			switch {
+			case status == 403:
 				failReason = "被站点拒绝(403)，可能需要有效 Cookie 或稍后重试"
+				needsCookie = true
+			case isNetworkFailure(err):
+				failReason = fmt.Sprintf("无法连接 %s：%s", hostOf(u), briefError(err))
+				networkError = true
+			default:
+				failReason = fmt.Sprintf("抓取 %s 失败: %v", u, err)
 			}
 			break
 		}
 		pagePacks, hasNext, parseErr := extractPacks(body, baseURL, pageNo)
 		if parseErr != nil {
 			failReason = fmt.Sprintf("解析 %s 失败: %v", u, parseErr)
+			break
+		}
+		if pageNo == 1 && len(pagePacks) == 0 {
+			// 首页能打开却没有任何曲包节点：官网对未登录访客展示登录墙时的典型表现。
+			failReason = "列表页可访问，但页面内没有曲包数据（通常表示官网要求登录后查看）"
+			needsCookie = true
 			break
 		}
 		added := 0
@@ -157,12 +213,57 @@ func ScrapeLinks(ctx context.Context, catID int, mode, cookie string) ScrapeResu
 	}
 
 	if failReason != "" {
-		return ScrapeResult{Failed: true, Reason: failReason}
+		return ScrapeResult{Failed: true, Reason: failReason, NeedsCookie: needsCookie, NetworkError: networkError}
 	}
 	if len(packs) == 0 {
 		return ScrapeResult{Failed: true, Reason: "该分类/模式下没有提取到任何曲包"}
 	}
 	return ScrapeResult{Packs: packs}
+}
+
+// isNetworkFailure 判断错误是否属于“连不上站点”层级（DNS/超时/连接被拒绝等），Cookie 无法解决这类问题。
+func isNetworkFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// briefError 把底层错误压缩成简短可读的中文原因，用于重试提示与最终提示。
+func briefError(err error) string {
+	if err == nil {
+		return "未知错误"
+	}
+	raw := err.Error()
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.Contains(lower, "forbidden by its access permissions"):
+		return "连接被系统拒绝(WSAEACCES)，通常由防火墙/安全软件或受限沙箱环境导致"
+	case strings.Contains(lower, "no such host"):
+		return "域名解析失败，请检查 DNS 或网络"
+	case strings.Contains(lower, "proxyconnect") || strings.Contains(lower, "proxy"):
+		return "代理连接失败，请检查代理地址与端口"
+	case strings.Contains(lower, "connection refused"):
+		return "连接被拒绝，请检查网络或代理"
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded"):
+		return "连接超时，请检查网络或代理"
+	case strings.HasPrefix(raw, "HTTP "):
+		return raw
+	default:
+		if len(raw) > 160 {
+			raw = raw[:160] + "…"
+		}
+		return raw
+	}
+}
+
+// hostOf 返回 URL 的 host，解析失败时返回原字符串。
+func hostOf(u string) string {
+	if parsed, err := url.Parse(u); err == nil && parsed.Host != "" {
+		return parsed.Host
+	}
+	return u
 }
 
 // extractPacks 解析列表页 HTML，返回曲包列表与“是否有下一页”。

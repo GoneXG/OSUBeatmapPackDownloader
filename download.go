@@ -68,9 +68,17 @@ func ExecuteDownload(ctx context.Context, aria2Path, targetDir, cookie string, i
 		}
 
 		badCookie := false
+		netBroken := false
 		var fallbackItems []aria2Item
-		for _, it := range failed {
-			href, ok, requiresLogin := fetchRawDownloadURL(ctx, it.Pack, cookie)
+		for i, it := range failed {
+			if len(failed) > 1 {
+				msgf("      查询官方存储地址 (%d/%d): %s", i+1, len(failed), it.Pack.Tag)
+			}
+			href, ok, requiresLogin, netErr := fetchRawDownloadURL(ctx, it.Pack, cookie)
+			if netErr != nil {
+				netBroken = true
+				continue
+			}
 			if requiresLogin {
 				badCookie = true
 				continue
@@ -80,6 +88,11 @@ func ExecuteDownload(ctx context.Context, aria2Path, targetDir, cookie string, i
 			}
 		}
 
+		if netBroken {
+			msgf("      查询官方存储地址失败: 无法连接 osu.ppy.sh（网络问题，重试 Cookie 无效）")
+			printNetworkHelp()
+			break
+		}
 		if len(fallbackItems) > 0 {
 			msgf("      对 %d 个失败曲包使用官方存储地址重试...", len(fallbackItems))
 			stillFailed := runAria2Pass(ctx, aria2Path, targetDir, cookie, fallbackItems)
@@ -314,21 +327,24 @@ var (
 )
 
 // fetchRawDownloadURL 带 Cookie 抓取 ?format=raw 页面并解析官方下载链接。
-// 返回 (官方地址, 是否找到, 页面是否仍提示需要登录)。
-func fetchRawDownloadURL(ctx context.Context, p Pack, cookie string) (string, bool, bool) {
+// 返回 (官方地址, 是否找到, 页面是否仍提示需要登录, 网络错误)。
+func fetchRawDownloadURL(ctx context.Context, p Pack, cookie string) (string, bool, bool, error) {
 	if cookie == "" {
-		return "", false, false
+		return "", false, false, nil
 	}
 	rawURL := strings.TrimRight(p.PageURL, "/") + "?format=raw"
 	body, status, err := HTTPGetWithCookie(ctx, rawURL, cookie)
-	if err != nil || status != 200 {
-		return "", false, false
+	if err != nil {
+		return "", false, false, err
+	}
+	if status != 200 {
+		return "", false, false, nil
 	}
 	lower := strings.ToLower(string(body))
 	// 未登录时的提示可能是英文或中文（取决于 Accept-Language）。
 	if strings.Contains(lower, "js-user-link") &&
 		(strings.Contains(lower, "signed in") || strings.Contains(lower, "登录")) {
-		return "", false, true
+		return "", false, true, nil
 	}
 	var href string
 	if m := downloadLinkClassFirst.FindSubmatch(body); m != nil {
@@ -338,14 +354,14 @@ func fetchRawDownloadURL(ctx context.Context, p Pack, cookie string) (string, bo
 	}
 	href = strings.TrimSpace(href)
 	if href == "" {
-		return "", false, false
+		return "", false, false, nil
 	}
 	if strings.HasPrefix(href, "//") {
 		href = "https:" + href
 	} else if strings.HasPrefix(href, "/") {
 		href = "https://osu.ppy.sh" + href
 	}
-	return href, true, false
+	return href, true, false, nil
 }
 
 // SaveFailedLog T10：失败链接写入 failed.txt；写入失败仅警告。

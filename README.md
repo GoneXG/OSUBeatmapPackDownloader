@@ -71,6 +71,10 @@
 | 参数 | 作用 | 示例 |
 | --- | --- | --- |
 | `-dir <路径>` | 修改下载目录 | `.\osu-pack-downloader.exe -dir "D:\osu曲包"` |
+| `-proxy <地址>` | 通过代理联网（不填则使用系统代理） | `.\osu-pack-downloader.exe -proxy http://127.0.0.1:7890` |
+| `-nopause` | 出错后不等待回车直接退出（脚本调用时用） | `.\osu-pack-downloader.exe -nopause` |
+
+> 出错时程序会停在「按回车键关闭窗口...」，方便双击运行时看清原因；不想停留就加 `-nopause`。
 
 ## 从源码编译（可选）
 
@@ -136,6 +140,7 @@ https://packs.ppy.sh/S1813%20-%20osu%21%20Beatmap%20Pack%20%231813.zip
 ### 5. 遇到限制时的兜底方案
 
 - **列表页被抓取拒绝（HTTP 403）**：程序会提示你手动粘贴浏览器里的 `osu_session` Cookie，用登录身份重新抓取。Cookie 仅用于本次请求，程序不会把它写入磁盘文件。
+- **连不上 osu.ppy.sh（不是 403）**：这类失败是网络层问题（DNS、超时、防火墙，或运行在受限的沙箱/IDE 内置终端里），粘贴 Cookie 也无法解决，因此程序会直接打印排查建议并退出，不会反复索要 Cookie。
 - **个别老曲包直链 404**：程序会带上 Cookie 访问该曲包的 `?format=raw` 详情页，解析页面中的真实下载地址后重试一次。
 
 > `osu_session` Cookie 相当于账号的登录凭证，请只在可信的电脑上使用，不要发给任何人。
@@ -159,6 +164,15 @@ A：把 `aria2c.exe` 放到程序旁的 `tools/` 目录（或加入系统 PATH�
 **Q：提示需要粘贴 osu_session Cookie？**
 
 A：用浏览器登录 <https://osu.ppy.sh/home> 后按 `F12` → Application → Cookies → `https://osu.ppy.sh`，找到名为 `osu_session` 的条目并复制它的 Value，回到程序粘贴后回车。只粘贴 Value、粘贴 `osu_session=...` 键值对或整段 `Cookie:` 请求头都可以，程序会自动解析；旧教程里的 `osu_sid` 也会被自动纠正为 `osu_session`。
+
+**Q：输入 Cookie 后程序好像没反应，或者提示「连接被系统拒绝(WSAEACCES)」？**
+
+A：这是网络层被拦截，Cookie 帮不上忙，程序现在会立刻把原因和建议打出来（重试过程也有提示，不会长时间静默）。常见处理顺序：
+
+1. 先用浏览器打开 <https://osu.ppy.sh/beatmaps/packs?type=standard>，确认本机能访问官网；
+2. 如果你是从 IDE / 沙箱 / Codex 等内置终端启动的，改用普通 PowerShell、CMD 或直接双击 `osu-pack-downloader.exe` 运行；
+3. 已经能上网但程序连不上，多半是防火墙或安全软件拦截，放行本程序即可；
+4. 需要走代理时用 `-proxy` 参数启动，例如 `.\osu-pack-downloader.exe -proxy http://127.0.0.1:7890`（也可提前设置环境变量 `HTTPS_PROXY`）。
 
 **Q：下载到一半中断了怎么办？**
 

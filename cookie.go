@@ -35,6 +35,8 @@ func ManualCookieInput() (string, bool) {
 		fmt.Println("未能从中识别 osu_session Cookie，视为放弃重试。")
 		return "", true
 	}
+	// 立即回显，确认回车已被程序接收，避免用户误以为程序没反应。
+	fmt.Printf("已收到 Cookie（%d 字节），正在继续...\n", len(header))
 	return header, false
 }
 

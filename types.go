@@ -47,4 +47,8 @@ type ScrapeResult struct {
 	Packs  []Pack
 	Failed bool
 	Reason string
+	// NeedsCookie 表示失败原因疑似“未登录/被风控拦截”，粘贴 osu_session Cookie 后有可能解决。
+	NeedsCookie bool
+	// NetworkError 表示失败原因是连不上站点（DNS/超时/被系统拒绝等），Cookie 无法解决。
+	NetworkError bool
 }

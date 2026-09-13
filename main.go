@@ -7,13 +7,24 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 )
 
 const backOption = "← 返回上级菜单"
 
+var (
+	flagDownloadDir = flag.String("dir", DownloadRoot, "下载根目录")
+	flagProxy       = flag.String("proxy", "", "HTTP/HTTPS 代理，例如 http://127.0.0.1:7890；留空则使用系统代理")
+	flagNoPause     = flag.Bool("nopause", false, "结束后不等待回车（脚本/自动化调用时使用）")
+)
+
 func main() {
+	flag.Parse()
+	proxyURL = strings.TrimSpace(*flagProxy)
+
 	if err := run(); err != nil {
 		fmt.Printf("\n程序中止: %v\n", err)
+		pauseBeforeExit()
 		os.Exit(1)
 	}
 }
@@ -23,11 +34,9 @@ func run() error {
 	fmt.Println("  osu! Beatmap Pack 曲包下载器")
 	fmt.Println("==============================================")
 
-	// 可选启动参数：下载根目录（所有文件混存于此）。
-	downloadRoot := flag.String("dir", DownloadRoot, "下载根目录")
-	flag.Parse()
-	if *downloadRoot != "" {
-		DownloadRoot = filepath.Clean(*downloadRoot)
+	// 启动参数已在 main 中解析：-dir 指定下载根目录（所有文件混存于此）。
+	if *flagDownloadDir != "" {
+		DownloadRoot = filepath.Clean(*flagDownloadDir)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -66,10 +75,14 @@ func run() error {
 	scrape := ScrapeLinks(ctx, choice.CatID, choice.Mode, "")
 	if scrape.Failed && ctx.Err() == nil {
 		msgf("      直连抓取失败: %s", scrape.Reason)
+	}
+	// 只有“疑似未登录/被拦截”时才索要 Cookie；连不上站点时 Cookie 无用，继续索要只会让人以为程序没反应。
+	if scrape.Failed && scrape.NeedsCookie && ctx.Err() == nil {
 		msgf("      将改为手动粘贴 osu_session Cookie 后重新爬取真实链接。")
 		for attempt := 1; attempt <= 3; attempt++ {
 			val, skip := ManualCookieInput()
 			if skip {
+				msgf("      已跳过 Cookie 重试。")
 				break
 			}
 			cookie = val
@@ -80,6 +93,10 @@ func run() error {
 				break
 			}
 			msgf("      带 Cookie 抓取仍失败: %s", scrape.Reason)
+			if !scrape.NeedsCookie {
+				// 已经变成网络层问题，再粘贴 Cookie 也没有意义。
+				break
+			}
 		}
 	}
 
@@ -87,12 +104,15 @@ func run() error {
 	if scrape.Failed {
 		scrapeFailedReason = scrape.Reason
 		msgf("      抓取失败: %s", scrapeFailedReason)
+		if scrape.NetworkError {
+			printNetworkHelp()
+		}
 		msgf("      跳过：本次未生成下载列表。")
 		if err := writeScrapeFailure(); err != nil {
 			return err
 		}
 		SaveFailedLog(nil, scrapeFailedReason)
-		return nil
+		return fmt.Errorf("抓取失败，未生成下载列表")
 	}
 	packs := scrape.Packs
 	msgf("抓取完成，共 %d 个曲包。", len(packs))
@@ -284,4 +304,31 @@ func e2eCheck(targetDir string, total, failed int) error {
 	msgf("FAIL: 部分文件缺失（目标目录: %s）", targetDir)
 	msgf("      失败明细已写入 %s", filepath.Join(UrlOutputDir, "failed.txt"))
 	return fmt.Errorf("FAIL: 部分文件缺失（完成 %d，预期至少 %d）", done, expected)
+}
+
+// printNetworkHelp 打印连不上 osu.ppy.sh 时的排查建议。
+func printNetworkHelp() {
+	msgf("      无法访问 osu.ppy.sh，请按顺序排查：")
+	msgf("        1) 浏览器能否打开 https://osu.ppy.sh/beatmaps/packs?type=standard；打不开说明是本机网络问题；")
+	msgf("        2) 若在受限环境（IDE/沙箱内置终端、虚拟机、公司网络）里运行，请改用普通 PowerShell 或 CMD 直接运行本程序；")
+	msgf("        3) 已经能上网但程序连不上时，多半是防火墙/安全软件拦截，放行本程序即可；")
+	msgf("        4) 需要代理时启动加参数，例如: .\\osu-pack-downloader.exe -proxy http://127.0.0.1:7890")
+}
+
+// isInteractiveConsole 判断标准输入是否为控制台（双击运行、交互终端为 true；管道/重定向为 false）。
+func isInteractiveConsole() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// pauseBeforeExit 在出错后等待回车，避免双击运行时窗口一闪而过、看不到错误信息。
+func pauseBeforeExit() {
+	if *flagNoPause || !isInteractiveConsole() {
+		return
+	}
+	fmt.Print("\n按回车键关闭窗口...")
+	_, _ = stdinReader.ReadString('\n')
 }
