@@ -16,6 +16,7 @@ var (
 	flagDownloadDir = flag.String("dir", DownloadRoot, "下载根目录")
 	flagProxy       = flag.String("proxy", "", "HTTP/HTTPS 代理，例如 http://127.0.0.1:7890；留空则使用系统代理")
 	flagNoPause     = flag.Bool("nopause", false, "结束后不等待回车（脚本/自动化调用时使用）")
+	flagLookupConc  = flag.Int("lookup-concurrency", defaultLookupConcurrency, "失败曲包链接重查的并发数（1~8）")
 )
 
 func main() {
@@ -38,6 +39,7 @@ func run() error {
 	if *flagDownloadDir != "" {
 		DownloadRoot = filepath.Clean(*flagDownloadDir)
 	}
+	LookupConcurrency = ClampLookupConcurrency(*flagLookupConc)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

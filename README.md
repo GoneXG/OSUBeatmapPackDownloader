@@ -72,6 +72,7 @@
 | --- | --- | --- |
 | `-dir <路径>` | 修改下载目录 | `.\osu-pack-downloader.exe -dir "D:\osu曲包"` |
 | `-proxy <地址>` | 通过代理联网（不填则使用系统代理） | `.\osu-pack-downloader.exe -proxy http://127.0.0.1:7890` |
+| `-lookup-concurrency <数量>` | 失败曲包链接重查的并发数（默认 4，上限 8） | `.\osu-pack-downloader.exe -lookup-concurrency 8` |
 | `-nopause` | 出错后不等待回车直接退出（脚本调用时用） | `.\osu-pack-downloader.exe -nopause` |
 
 > 出错时程序会停在「按回车键关闭窗口...」，方便双击运行时看清原因；不想停留就加 `-nopause`。
@@ -141,7 +142,7 @@ https://packs.ppy.sh/S1813%20-%20osu%21%20Beatmap%20Pack%20%231813.zip
 
 - **列表页被抓取拒绝（HTTP 403）**：程序会提示你手动粘贴浏览器里的 `osu_session` Cookie，用登录身份重新抓取。Cookie 仅用于本次请求，程序不会把它写入磁盘文件。
 - **连不上 osu.ppy.sh（不是 403）**：这类失败是网络层问题（DNS、超时、防火墙，或运行在受限的沙箱/IDE 内置终端里），粘贴 Cookie 也无法解决，因此程序会直接打印排查建议并退出，不会反复索要 Cookie。
-- **个别老曲包直链 404**：程序会带上 Cookie 访问该曲包的 `?format=raw` 详情页，解析页面中的真实下载地址后重试一次。
+- **个别老曲包直链 404**：程序会带上 Cookie 并发访问这些曲包的 `?format=raw` 详情页（并发数见 `-lookup-concurrency`，默认 4），解析页面中的真实下载地址后重试一次；一旦发现网络层错误会立即停止后续查询并给出排查建议。
 
 > `osu_session` Cookie 相当于账号的登录凭证，请只在可信的电脑上使用，不要发给任何人。
 

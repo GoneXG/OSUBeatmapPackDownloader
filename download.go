@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,6 +50,94 @@ type aria2Item struct {
 	Pack Pack
 }
 
+const (
+	// defaultLookupConcurrency 失败曲包链接重查的默认并发数。
+	defaultLookupConcurrency = 4
+	// maxLookupConcurrency 并发重查的硬上限，避免对 osu.ppy.sh 造成突发压力。
+	maxLookupConcurrency = 8
+)
+
+// LookupConcurrency 失败曲包链接重查的并发数，可由 -lookup-concurrency 调整（取值 1~maxLookupConcurrency）。
+var LookupConcurrency = defaultLookupConcurrency
+
+// ClampLookupConcurrency 把 -lookup-concurrency 的输入收敛到 1~maxLookupConcurrency；
+// 越界时返回边界值，并提示实际使用的并发数。
+func ClampLookupConcurrency(n int) int {
+	if n < 1 {
+		msgf("提示: -lookup-concurrency=%d 超出范围(1~%d)，改用 %d。", n, maxLookupConcurrency, 1)
+		return 1
+	}
+	if n > maxLookupConcurrency {
+		msgf("提示: -lookup-concurrency=%d 超出范围(1~%d)，改用 %d。", n, maxLookupConcurrency, maxLookupConcurrency)
+		return maxLookupConcurrency
+	}
+	return n
+}
+
+// packLookupFunc 查询单个曲包的官方存储地址，返回 (地址, 是否找到, 是否需要登录, 网络错误)。
+type packLookupFunc func(ctx context.Context, p Pack, cookie string) (string, bool, bool, error)
+
+// packLookupOutcome 单个曲包的重查结果。
+type packLookupOutcome struct {
+	href          string
+	found         bool
+	requiresLogin bool
+	netErr        error
+}
+
+// lookupPackLinks 并发重查失败曲包的官方存储地址，结果按输入顺序一一对应返回。
+// 固定数量的 worker 领取任务，保证在途查询数不超过 concurrency；
+// 任一查询出现网络层错误时立即取消后续任务（已在途的查询允许自然返回），避免用户长时间干等。
+func lookupPackLinks(ctx context.Context, packs []Pack, cookie string, concurrency int, lookup packLookupFunc) []packLookupOutcome {
+	results := make([]packLookupOutcome, len(packs))
+	if len(packs) == 0 {
+		return results
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > len(packs) {
+		concurrency = len(packs)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		next      int64 // 下一个待领取的任务下标
+		completed int64 // 已完成数量，用于进度序号
+		workers   sync.WaitGroup
+		total     = len(packs)
+	)
+	for w := 0; w < concurrency; w++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				if runCtx.Err() != nil {
+					return
+				}
+				idx := int(atomic.AddInt64(&next, 1)) - 1
+				if idx >= total || runCtx.Err() != nil {
+					return
+				}
+				href, found, requiresLogin, err := lookup(runCtx, packs[idx], cookie)
+				results[idx] = packLookupOutcome{href: href, found: found, requiresLogin: requiresLogin, netErr: err}
+				seq := atomic.AddInt64(&completed, 1)
+				// msgf 内部有互斥锁，保证整行输出不会与其他并发输出交错。
+				msgf("      查询官方存储地址 (%d/%d): %s", seq, total, packs[idx].Tag)
+				if err != nil && isNetworkFailure(err) {
+					// 网络层错误：不再发起新查询，已在途的请求允许返回。
+					cancel()
+					return
+				}
+			}
+		}()
+	}
+	workers.Wait()
+	return results
+}
+
 // ExecuteDownload：调用 aria2 批量下载，返回最终失败的曲包。
 // 直链失败时尝试用 Cookie 读取官方存储地址重试；Cookie 未生效会提示并允许重新粘贴。
 func ExecuteDownload(ctx context.Context, aria2Path, targetDir, cookie string, items []aria2Item) []aria2Item {
@@ -57,7 +146,7 @@ func ExecuteDownload(ctx context.Context, aria2Path, targetDir, cookie string, i
 		return nil
 	}
 
-	msgf("      有 %d 个曲包直链下载失败，尝试获取官方存储地址重试...", len(failed))
+	msgf("      有 %d 个曲包直链下载失败，尝试获取官方存储地址重试（并发 %d）...", len(failed), LookupConcurrency)
 	for attempt := 1; attempt <= 3 && len(failed) > 0; attempt++ {
 		if cookie == "" {
 			val, skip := ManualCookieInput()
@@ -67,24 +156,27 @@ func ExecuteDownload(ctx context.Context, aria2Path, targetDir, cookie string, i
 			cookie = val
 		}
 
+		// 并发重查：失败曲包很多时不再逐个串行等待。
+		packs := make([]Pack, 0, len(failed))
+		for _, it := range failed {
+			packs = append(packs, it.Pack)
+		}
+		outcomes := lookupPackLinks(ctx, packs, cookie, LookupConcurrency, fetchRawDownloadURL)
+
 		badCookie := false
 		netBroken := false
 		var fallbackItems []aria2Item
-		for i, it := range failed {
-			if len(failed) > 1 {
-				msgf("      查询官方存储地址 (%d/%d): %s", i+1, len(failed), it.Pack.Tag)
-			}
-			href, ok, requiresLogin, netErr := fetchRawDownloadURL(ctx, it.Pack, cookie)
-			if netErr != nil {
+		for i, out := range outcomes {
+			if out.netErr != nil {
 				netBroken = true
 				continue
 			}
-			if requiresLogin {
+			if out.requiresLogin {
 				badCookie = true
 				continue
 			}
-			if ok && href != "" {
-				fallbackItems = append(fallbackItems, aria2Item{URL: href, Pack: it.Pack})
+			if out.found && out.href != "" {
+				fallbackItems = append(fallbackItems, aria2Item{URL: out.href, Pack: packs[i]})
 			}
 		}
 
