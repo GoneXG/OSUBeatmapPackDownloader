@@ -521,13 +521,19 @@ func statBatch(targetDir string, items []aria2Item) batchStat {
 // reportBatchProgress 周期性输出批次进度。
 // bar 模式每秒原地刷新一行进度条；line 模式每 3 秒输出一行完整文本；off 模式不输出周期进度。
 // 说明：aria2 会预分配完整文件，进行中任务的字节数来自 RPC 或摘要行，已完成部分才按磁盘体积统计。
+var (
+	// 进度采样间隔：bar 模式原地刷新，line 模式输出整块文本；集成测试会调小以缩短运行时间。
+	progressBarTickInterval  = time.Second
+	progressLineTickInterval = 3 * time.Second
+)
+
 func reportBatchProgress(ctx context.Context, targetDir string, items []aria2Item, mode progressDisplayMode, summary *summaryProgress, stop <-chan struct{}) {
 	if mode == progressOffMode {
 		return
 	}
-	interval := time.Second
+	interval := progressBarTickInterval
 	if mode == progressLineMode {
-		interval = 3 * time.Second
+		interval = progressLineTickInterval
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -536,9 +542,9 @@ func reportBatchProgress(ctx context.Context, targetDir string, items []aria2Ite
 		st := statBatch(targetDir, items)
 		snap := collectProgress(ctx, targetDir, items, st, summary)
 		if mode == progressBarMode {
-			drawProgressBar(FormatProgressBarFrame(snap, progressBarWidth))
+			drawProgressBlock(FormatProgressBlock(snap, progressBarWidth, true))
 		} else {
-			msgf("%s", FormatProgressLine(snap))
+			msgLines(FormatProgressBlock(snap, progressBarWidth, false))
 		}
 		return st.done >= len(items) && st.active == 0
 	}

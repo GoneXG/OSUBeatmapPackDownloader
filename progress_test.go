@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +11,9 @@ import (
 	"testing"
 	"unicode/utf8"
 )
+
+// errNoVirtualTerminal 模拟「终端不支持 ANSI 多行原地刷新」。
+var errNoVirtualTerminal = errors.New("终端不支持 ANSI")
 
 // etaRe 匹配完整的 ETA 文本（mm:ss 或 h:mm:ss），用于确认进度条未被截断。
 var etaRe = regexp.MustCompile(`ETA (\d+:\d\d:\d\d|\d\d:\d\d)$`)
@@ -100,16 +104,27 @@ func TestFormatProgressBarFrameIsAsciiAndBounded(t *testing.T) {
 	}
 }
 
-func TestProgressBarClearsPreviousFrameAndRedrawsAfterMessage(t *testing.T) {
+// stubVirtualTerminal 让测试控制终端是否支持多行原地刷新。
+func stubVirtualTerminal(t *testing.T, err error) {
+	t.Helper()
+	orig := enableVirtualTerminal
+	enableVirtualTerminal = func() error { return err }
+	t.Cleanup(func() { enableVirtualTerminal = orig })
+}
+
+func TestProgressBlockFallsBackToSingleLineWithoutAnsi(t *testing.T) {
+	stubVirtualTerminal(t, errNoVirtualTerminal)
 	enableProgressBar()
-	defer disableProgressBar()
 
 	out := captureStdout(t, func() {
-		drawProgressBar("AAAAAAAA")
-		drawProgressBar("BB")
+		drawProgressBlock([]string{"AAAAAAAA", "曲包行不该出现在回退模式"})
+		drawProgressBlock([]string{"BB"})
 		msgf("事件行")
 	})
 
+	if strings.Contains(out, "\x1b") {
+		t.Fatalf("回退模式不应写入 ANSI 控制序列，输出: %q", out)
+	}
 	// 第二帧比第一帧短：必须用空格覆盖多出的 6 个字符，避免残留。
 	if !strings.Contains(out, "\r        \r") {
 		t.Fatalf("较短的新帧未清除上一帧残留，输出: %q", out)
@@ -118,7 +133,43 @@ func TestProgressBarClearsPreviousFrameAndRedrawsAfterMessage(t *testing.T) {
 		t.Fatalf("事件行未独占一行输出，输出: %q", out)
 	}
 	if !strings.HasSuffix(out, "\rBB") {
-		t.Fatalf("打印事件后应重绘最新进度条帧，输出: %q", out)
+		t.Fatalf("打印事件后应重绘最新进度块，输出: %q", out)
+	}
+	// 在捕获环境内收尾，避免把清理序列写到真实 stdout。
+	afterDisable := captureStdout(t, func() { disableProgressBar() })
+	if strings.Contains(afterDisable, "\x1b") {
+		t.Fatalf("回退模式收尾不应写入 ANSI 序列，输出: %q", afterDisable)
+	}
+}
+
+func TestProgressBlockInPlaceErasesShrunkBlock(t *testing.T) {
+	stubVirtualTerminal(t, nil)
+	enableProgressBar()
+
+	out := captureStdout(t, func() {
+		drawProgressBlock([]string{"L1", "L2", "L3"})
+		drawProgressBlock([]string{"N1"})
+		msgf("事件行")
+	})
+
+	if !strings.Contains(out, "\rL1\nL2\nL3") {
+		t.Fatalf("应整块绘制三行，输出: %q", out)
+	}
+	// 块从三行缩短到一行：必须自下而上擦除三行（\r\x1b[2K + \x1b[1A）。
+	wantClear := "\r\x1b[2K\x1b[1A\r\x1b[2K\x1b[1A\r\x1b[2K"
+	if !strings.Contains(out, wantClear) {
+		t.Fatalf("块变矮时未擦除多出的行，输出: %q", out)
+	}
+	if !strings.Contains(out, "事件行\n") {
+		t.Fatalf("事件行未独占一行输出，输出: %q", out)
+	}
+	if !strings.HasSuffix(out, "\rN1") {
+		t.Fatalf("打印事件后应重绘最新进度块，输出: %q", out)
+	}
+
+	afterDisable := captureStdout(t, func() { disableProgressBar() })
+	if !strings.Contains(afterDisable, "\r\x1b[2K") {
+		t.Fatalf("收尾时应清除进度块残留，输出: %q", afterDisable)
 	}
 }
 
