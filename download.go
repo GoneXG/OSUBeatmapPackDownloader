@@ -85,6 +85,21 @@ type packLookupOutcome struct {
 	netErr        error
 }
 
+// maxCookieAttempts 恢复流程中向用户索要 Cookie 的最大次数（超过即停止重试）。
+const maxCookieAttempts = 3
+
+// packRecoveryDeps 失败曲包恢复循环的外部依赖，便于单元测试注入假实现。
+//   - lookup：查询单个曲包的官方存储地址；
+//   - download：对给定批次执行一次 aria2 下载，返回仍失败的曲包；
+//   - promptCookie：向用户索要 Cookie，返回 (Cookie, 是否跳过)；
+//   - concurrency：重查官方地址时的并发数。
+type packRecoveryDeps struct {
+	lookup       packLookupFunc
+	download     func(ctx context.Context, cookie string, items []aria2Item) []aria2Item
+	promptCookie func() (string, bool)
+	concurrency  int
+}
+
 // lookupPackLinks 并发重查失败曲包的官方存储地址，结果按输入顺序一一对应返回。
 // 固定数量的 worker 领取任务，保证在途查询数不超过 concurrency；
 // 任一查询出现网络层错误时立即取消后续任务（已在途的查询允许自然返回），避免用户长时间干等。
@@ -138,30 +153,52 @@ func lookupPackLinks(ctx context.Context, packs []Pack, cookie string, concurren
 	return results
 }
 
-// ExecuteDownload：调用 aria2 批量下载，返回最终失败的曲包。
-// 直链失败时尝试用 Cookie 读取官方存储地址重试；Cookie 未生效会提示并允许重新粘贴。
-func ExecuteDownload(ctx context.Context, aria2Path, targetDir, cookie string, items []aria2Item) []aria2Item {
-	failed := runAria2Pass(ctx, aria2Path, targetDir, cookie, items)
+// recoverFailedPacks 多轮重查失败曲包的官方存储地址并用新地址重下，直到失败列表为空、
+// 某一轮毫无进展或遇到 Cookie/网络等终止条件为止；返回最终仍失败的曲包（保持输入顺序）。
+//
+// 推进条件（见 openspec/changes/continue-failed-pack-retry）：只有本轮有曲包被成功下载才进入下一轮，
+// 成功项永久移出失败集合，因此进度严格单调、循环必然收敛；本轮未取得官方地址的曲包保留在
+// 失败列表并进入下一轮重查，不作为终态。
+func recoverFailedPacks(ctx context.Context, failed []aria2Item, cookie string, deps packRecoveryDeps) []aria2Item {
 	if len(failed) == 0 {
 		return nil
 	}
+	if deps.concurrency < 1 {
+		deps.concurrency = 1
+	}
+	if deps.promptCookie == nil {
+		deps.promptCookie = ManualCookieInput
+	}
 
-	msgf("      有 %d 个曲包直链下载失败，尝试获取官方存储地址重试（并发 %d）...", len(failed), LookupConcurrency)
-	for attempt := 1; attempt <= 3 && len(failed) > 0; attempt++ {
+	// 已有 Cookie（例如抓取阶段用户粘贴过）算作第 1 次尝试，保证总尝试次数不超过 3 次。
+	cookieAttempts := 0
+	if cookie != "" {
+		cookieAttempts = 1
+	}
+	for round := 1; len(failed) > 0; round++ {
+		if ctx.Err() != nil {
+			break
+		}
 		if cookie == "" {
-			val, skip := ManualCookieInput()
+			cookieAttempts++
+			if cookieAttempts > maxCookieAttempts {
+				msgf("      已连续 %d 次输入的 Cookie 未生效，停止重试剩余曲包。", maxCookieAttempts)
+				break
+			}
+			val, skip := deps.promptCookie()
 			if skip {
 				break
 			}
 			cookie = val
 		}
 
-		// 并发重查：失败曲包很多时不再逐个串行等待。
+		// 每轮都把当前仍失败的全部曲包交给重查：本轮未取得地址的曲包也要在下一轮继续尝试。
 		packs := make([]Pack, 0, len(failed))
 		for _, it := range failed {
 			packs = append(packs, it.Pack)
 		}
-		outcomes := lookupPackLinks(ctx, packs, cookie, LookupConcurrency, fetchRawDownloadURL)
+		msgf("      第 %d 轮：剩余 %d 个失败曲包，开始重查官方存储地址（并发 %d）...", round, len(packs), deps.concurrency)
+		outcomes := lookupPackLinks(ctx, packs, cookie, deps.concurrency, deps.lookup)
 
 		badCookie := false
 		netBroken := false
@@ -185,37 +222,73 @@ func ExecuteDownload(ctx context.Context, aria2Path, targetDir, cookie string, i
 			printNetworkHelp()
 			break
 		}
-		if len(fallbackItems) > 0 {
-			msgf("      对 %d 个失败曲包使用官方存储地址重试...", len(fallbackItems))
-			stillFailed := runAria2Pass(ctx, aria2Path, targetDir, cookie, fallbackItems)
-			retried := map[string]bool{}
-			for _, it := range fallbackItems {
-				retried[it.Pack.Tag] = true
+		if len(fallbackItems) == 0 {
+			if badCookie {
+				cookie = deps.rejectCookie(cookieAttempts)
+				continue
 			}
-			still := map[string]bool{}
-			for _, it := range stillFailed {
-				still[it.Pack.Tag] = true
-			}
-			var next []aria2Item
-			for _, it := range failed {
-				// 已用官方地址重试且成功 -> 不算失败；其余保留。
-				if retried[it.Pack.Tag] && !still[it.Pack.Tag] {
-					continue
-				}
-				next = append(next, it)
-			}
-			failed = next
+			msgf("      Cookie 已生效，但官网未提供这些曲包的下载地址（可能已下架），本轮无进展。")
 			break
 		}
 
-		if badCookie {
-			msgf("      Cookie 未生效：页面仍提示需要登录。请确认复制的是 osu_session 的 Value 或整段 Cookie（第 %d/3 次）。", attempt)
-			cookie = ""
-			continue
+		msgf("      对 %d 个失败曲包使用官方存储地址重试...", len(fallbackItems))
+		stillFailed := deps.download(ctx, cookie, fallbackItems)
+		progressed := len(fallbackItems) - len(stillFailed)
+
+		retried := map[string]bool{}
+		for _, it := range fallbackItems {
+			retried[it.Pack.Tag] = true
 		}
-		msgf("      Cookie 已生效，但官网未提供这些曲包的下载地址（可能已下架）。")
-		break
+		still := map[string]bool{}
+		for _, it := range stillFailed {
+			still[it.Pack.Tag] = true
+		}
+		remaining := make([]aria2Item, 0, len(failed))
+		for _, it := range failed {
+			// 已用官方地址重试且成功 -> 永久移出失败集合；其余保留。
+			if retried[it.Pack.Tag] && !still[it.Pack.Tag] {
+				continue
+			}
+			remaining = append(remaining, it)
+		}
+		failed = remaining
+		msgf("      第 %d 轮：重下 %d 个，成功 %d 个，剩余失败 %d 个", round, len(fallbackItems), progressed, len(failed))
+
+		if progressed == 0 {
+			msgf("      本轮无进展，停止重试。")
+			break
+		}
+		if badCookie {
+			// 仍有曲包停在登录墙：清空 Cookie，下一轮重新向用户索要。
+			cookie = deps.rejectCookie(cookieAttempts)
+		}
 	}
+	return failed
+}
+
+// rejectCookie 在判定 Cookie 未生效时提示用户重新粘贴，并清空 Cookie 供下一轮重新索要。
+func (deps packRecoveryDeps) rejectCookie(cookieAttempts int) string {
+	msgf("      Cookie 未生效：页面仍提示需要登录。请确认复制的是 osu_session 的 Value 或整段 Cookie（第 %d/%d 次）。", cookieAttempts, maxCookieAttempts)
+	return ""
+}
+
+// ExecuteDownload：调用 aria2 批量下载，返回最终失败的曲包。
+// 直链失败时尝试用 Cookie 读取官方存储地址重试，多轮进行直到剩余曲包不再减少。
+func ExecuteDownload(ctx context.Context, aria2Path, targetDir, cookie string, items []aria2Item) []aria2Item {
+	failed := runAria2Pass(ctx, aria2Path, targetDir, cookie, items)
+	if len(failed) == 0 {
+		return nil
+	}
+
+	msgf("      有 %d 个曲包直链下载失败，尝试获取官方存储地址重试（并发 %d，多轮直到无进展）...", len(failed), LookupConcurrency)
+	failed = recoverFailedPacks(ctx, failed, cookie, packRecoveryDeps{
+		lookup: fetchRawDownloadURL,
+		download: func(ctx context.Context, cookie string, batch []aria2Item) []aria2Item {
+			return runAria2Pass(ctx, aria2Path, targetDir, cookie, batch)
+		},
+		promptCookie: ManualCookieInput,
+		concurrency:  LookupConcurrency,
+	})
 	if len(failed) > 0 {
 		msgf("      最终失败 %d 个曲包，已记录到 failed.txt。", len(failed))
 	}
