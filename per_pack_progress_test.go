@@ -21,6 +21,81 @@ var aria2SummaryBlock = []string{
 	"[DL:4.5MiB][#5a2691 3.2MiB/20MiB(16%)][#cb42f4 3.1MiB/20MiB(15%)][#dbf186 3.0Mi",
 }
 
+// aria2SummaryWaitingTaskFrame 是本地实测（tools/aria2c.exe + 响应延迟的本地 HTTP 服务）抓到的摘要帧：
+// 第一个任务已经启动但服务器还没响应，aria2 只给出 `0B/0B CN:1 DL:0B`（既没有百分比，也没有总大小），
+// 此时它还没真正开始下载；第二个任务已经在正常传输。只有后者应该出现在进度里。
+var aria2SummaryWaitingTaskFrame = []string{
+	" *** Download Progress Summary as of Mon Sep 14 21:13:57 2026 *** ",
+	"===============================================================================",
+	"[#31e888 0B/0B CN:1 DL:0B]",
+	"FILE: C:/Users/cloud/AppData/Local/Temp/aria2-probe/dl/Pack Slow - test.zip",
+	"-------------------------------------------------------------------------------",
+	"[#58d265 1.1MiB/8.0MiB(14%) CN:1 DL:1.2MiB ETA:5s]",
+	"FILE: C:/Users/cloud/AppData/Local/Temp/aria2-probe/dl/Pack Fast - test.zip",
+	"-------------------------------------------------------------------------------",
+	"[DL:1.2MiB][#31e888 0B/0B][#58d265 1.1MiB/8.0MiB(14%)]",
+}
+
+func TestSummaryProgressHidesTasksWithoutData(t *testing.T) {
+	sum := &summaryProgress{}
+	for _, line := range aria2SummaryWaitingTaskFrame {
+		sum.note(line)
+	}
+
+	tasks := sum.activeTasks()
+	if len(tasks) != 1 || tasks[0].gid != "58d265" {
+		t.Fatalf("还没拿到下载数据（摘要行只有 0B/0B）的任务不应出现在进度里，实际 %+v", tasks)
+	}
+	done, total, _, ok := sum.activeProgress()
+	if !ok || done != parseAria2Size("1.1", "MiB") || total != parseAria2Size("8", "MiB") {
+		t.Fatalf("排队中的任务不应计入整体字节进度，实际 done=%d total=%d ok=%v", done, total, ok)
+	}
+
+	// 服务器响应后同一个 GID 开始传输：这时才出现进度行，并沿用之前 FILE: 行里的曲包文件名。
+	sum.note("[#31e888 64KiB/8.0MiB(0%) CN:1 DL:1.9MiB ETA:4s]")
+	tasks = sum.activeTasks()
+	if len(tasks) != 2 {
+		t.Fatalf("拿到数据后应出现两行曲包进度，实际 %+v", tasks)
+	}
+	if tasks[0].gid != "31e888" || tasks[0].file != "Pack Slow - test.zip" {
+		t.Fatalf("开始传输的任务应保留 FILE: 行绑定的文件名，实际 %+v", tasks[0])
+	}
+}
+
+func TestSummaryProgressDropsTasksMissingFromNextFrame(t *testing.T) {
+	sum := &summaryProgress{}
+	feed := func(lines ...string) {
+		for _, line := range lines {
+			sum.note(line)
+		}
+	}
+
+	feed(aria2SummaryBlock...)
+	if got := len(sum.activeTasks()); got != 2 {
+		t.Fatalf("第一帧应有两个正在下载的任务，实际 %d 个", got)
+	}
+
+	// 第二帧：Pack A 已下载完成，aria2 不再列出它，也不会补一行 100%。
+	feed(
+		" *** Download Progress Summary as of Mon Sep 14 20:45:57 2026 *** ",
+		"===============================================================================",
+		"[#cb42f4 5.2MiB/20MiB(26%) CN:1 DL:1.5MiB ETA:8s]",
+		"FILE: C:/Users/cloud/AppData/Local/Temp/aria2-probe/dl/Pack B - test.zip",
+		"-------------------------------------------------------------------------------",
+	)
+
+	// 第三帧开始：上一帧里消失的 Pack A 被移出进度，只剩仍在下载的 Pack B。
+	feed(
+		" *** Download Progress Summary as of Mon Sep 14 20:45:58 2026 *** ",
+		"[#cb42f4 6.4MiB/20MiB(32%) CN:1 DL:1.5MiB ETA:7s]",
+		"FILE: C:/Users/cloud/AppData/Local/Temp/aria2-probe/dl/Pack B - test.zip",
+	)
+	tasks := sum.activeTasks()
+	if len(tasks) != 1 || tasks[0].gid != "cb42f4" {
+		t.Fatalf("已完成的任务不再出现在摘要帧里，应从进度里移除，实际 %+v", tasks)
+	}
+}
+
 func TestSummaryProgressTracksPerTaskFiles(t *testing.T) {
 	sum := &summaryProgress{}
 	for _, line := range aria2SummaryBlock {

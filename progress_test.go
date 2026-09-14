@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"unicode/utf8"
 )
@@ -19,6 +21,8 @@ var errNoVirtualTerminal = errors.New("终端不支持 ANSI")
 var etaRe = regexp.MustCompile(`ETA (\d+:\d\d:\d\d|\d\d:\d\d)$`)
 
 // captureStdout 在测试期间接管 os.Stdout，返回函数执行期间写入的内容。
+// 读取必须与写入并发进行：管道缓冲区有限，写满后持有 printMu 的写方会一直阻塞，
+// 而 fn() 里还等着进度 goroutine 收尾，输出行一多就会互锁。
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	orig := os.Stdout
@@ -29,13 +33,23 @@ func captureStdout(t *testing.T, fn func()) string {
 	os.Stdout = w
 	defer func() { os.Stdout = orig }()
 
+	var (
+		buf bytes.Buffer
+		wg  sync.WaitGroup
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(&buf, r)
+	}()
+
 	fn()
 
 	w.Close()
 	os.Stdout = orig
-	data, _ := io.ReadAll(r)
+	wg.Wait()
 	r.Close()
-	return string(data)
+	return buf.String()
 }
 
 func TestParseAndResolveProgressMode(t *testing.T) {

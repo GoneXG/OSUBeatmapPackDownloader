@@ -20,6 +20,14 @@ type summaryTask struct {
 	speed       int64
 }
 
+// transferring 报告 aria2 是否已经为该任务建立连接并拿到下载数据。
+// 刚启动、还在等服务器响应的任务，摘要行形如 `[#5a2691 0B/0B CN:1 DL:0B]`：
+// 既没有总大小也没有已下载字节，说明它还没真正开始下载（排队/建连中），
+// 不应占用进度行，也不该计入进度数字。
+func (t summaryTask) transferring() bool {
+	return t.done > 0 || t.total > 0
+}
+
 // summaryProgress 从 aria2 的进度摘要块解析逐任务明细，例如：
 //
 //	[#8d9a4c 1.2MiB/33MiB(4%) CN:16 DL:1.2MiB ETA:26s]
@@ -32,14 +40,18 @@ type summaryProgress struct {
 	mu      sync.Mutex
 	tasks   map[string]summaryTask // gid -> 任务
 	pending string                 // 最近一个摘要行的 GID，等待其 FILE: 行补全文件名
+	frame   map[string]bool        // 最近一帧摘要块里出现过的 GID（见 startFrameLocked）
 }
 
 var (
 	// summaryTaskGroupRe 匹配摘要行里的一个任务组，如 `[#8d9a4c 1.2MiB/33MiB(4%)`。
 	summaryTaskGroupRe = regexp.MustCompile(`\[#([0-9a-zA-Z]{6,})\s+([0-9.]+)\s*([KMGT]?i?B)/([0-9.]+)\s*([KMGT]?i?B)`)
 	summarySpeedRe     = regexp.MustCompile(`DL:([0-9.]+)\s*([KMGT]?i?B)`)
-	// summaryBannerRe 匹配摘要块的分隔行（download progress summary 标题、==== 与 ----）。
-	summaryBannerRe = regexp.MustCompile(`(?i)^(\*+ download progress summary|=+\s*$|-{3,}\s*$)`)
+	// summaryTitleRe 匹配摘要块的标题行（如 `*** Download Progress Summary as of ... ***`）。
+	// 每出现一次标题就是新的一帧：上一帧里没有出现的任务已经结束（完成/失败/取消）。
+	summaryTitleRe = regexp.MustCompile(`(?i)\*+\s*download progress summary`)
+	// summarySeparatorRe 匹配摘要块内部的分隔行（==== 与 ----）。
+	summarySeparatorRe = regexp.MustCompile(`^(=+|-{3,})\s*$`)
 )
 
 // note 记录一行 aria2 输出；命中进度摘要（含 FILE: 行）返回 true（调用方据此不再原样打印）。
@@ -52,7 +64,13 @@ func (s *summaryProgress) note(line string) bool {
 	if strings.HasPrefix(trimmed, "FILE:") {
 		return s.noteFile(strings.TrimSpace(strings.TrimPrefix(trimmed, "FILE:")))
 	}
-	if summaryBannerRe.MatchString(trimmed) {
+	if summaryTitleRe.MatchString(trimmed) {
+		s.mu.Lock()
+		s.startFrameLocked()
+		s.mu.Unlock()
+		return true
+	}
+	if summarySeparatorRe.MatchString(trimmed) {
 		s.mu.Lock()
 		s.pending = ""
 		s.mu.Unlock()
@@ -66,6 +84,7 @@ func (s *summaryProgress) note(line string) bool {
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		s.markFrameLocked(task.gid)
 		s.storeLocked(task, true)
 		return true
 	}
@@ -122,6 +141,27 @@ func (s *summaryProgress) noteFile(path string) bool {
 	return true
 }
 
+// markFrameLocked 记录某个 GID 出现在当前摘要帧里；调用方必须持有 s.mu。
+func (s *summaryProgress) markFrameLocked(gid string) {
+	if s.frame == nil {
+		s.frame = map[string]bool{}
+	}
+	s.frame[gid] = true
+}
+
+// startFrameLocked 处理摘要帧的标题行，开启新的一帧：上一帧里没有出现的任务说明已经完成、
+// 失败或被取消，从登记表移除（否则它们会一直挂在进度块里，看起来像是还在下载）。
+// 调用方必须持有 s.mu。
+func (s *summaryProgress) startFrameLocked() {
+	for gid := range s.tasks {
+		if !s.frame[gid] {
+			delete(s.tasks, gid)
+		}
+	}
+	s.frame = map[string]bool{}
+	s.pending = ""
+}
+
 // storeLocked 写入/更新一个任务；waitFile 为真时把该 GID 记为「等待 FILE: 行」。
 // 调用方必须持有 s.mu。
 func (s *summaryProgress) storeLocked(task summaryTask, waitFile bool) {
@@ -163,7 +203,8 @@ func parseSummaryTaskLine(line string) (summaryTask, bool) {
 	return task, true
 }
 
-// activeTasks 返回仍在下载的任务（按 GID 排序，保证渲染顺序稳定）。
+// activeTasks 返回当前确实在下载的任务（已经建立连接、拿到了下载数据，按 GID 排序保证渲染顺序稳定）：
+// 摘要行只有 `0B/0B` 的排队/建连中任务不计入，已完成的由磁盘体积统计。
 func (s *summaryProgress) activeTasks() []summaryTask {
 	if s == nil {
 		return nil
@@ -175,7 +216,13 @@ func (s *summaryProgress) activeTasks() []summaryTask {
 	}
 	out := make([]summaryTask, 0, len(s.tasks))
 	for _, t := range s.tasks {
+		if !t.transferring() {
+			continue
+		}
 		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].gid < out[j].gid })
 	return out
