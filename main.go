@@ -17,6 +17,7 @@ var (
 	flagProxy       = flag.String("proxy", "", "HTTP/HTTPS 代理，例如 http://127.0.0.1:7890；留空则使用系统代理")
 	flagNoPause     = flag.Bool("nopause", false, "结束后不等待回车（脚本/自动化调用时使用）")
 	flagLookupConc  = flag.Int("lookup-concurrency", defaultLookupConcurrency, "失败曲包链接重查的并发数（1~8）")
+	flagProgress    = flag.String("progress", "bar", "下载进度显示方式: bar|line|off（非交互输出自动按 line 显示）")
 )
 
 func main() {
@@ -40,6 +41,12 @@ func run() error {
 		DownloadRoot = filepath.Clean(*flagDownloadDir)
 	}
 	LookupConcurrency = ClampLookupConcurrency(*flagLookupConc)
+	if mode, ok := ParseProgressMode(*flagProgress); ok {
+		ProgressMode = mode
+	} else {
+		msgf("提示: -progress=%q 无法识别，改用 bar。可选: bar | line | off", *flagProgress)
+		ProgressMode = progressBarMode
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

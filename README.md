@@ -73,9 +73,11 @@
 | `-dir <路径>` | 修改下载目录 | `.\osu-pack-downloader.exe -dir "D:\osu曲包"` |
 | `-proxy <地址>` | 通过代理联网（不填则使用系统代理） | `.\osu-pack-downloader.exe -proxy http://127.0.0.1:7890` |
 | `-lookup-concurrency <数量>` | 失败曲包链接重查的并发数（默认 4，上限 8） | `.\osu-pack-downloader.exe -lookup-concurrency 8` |
+| `-progress <模式>` | 下载进度显示：`bar` 单行进度条（默认）、`line` 每次一行文本、`off` 不显示 | `.\osu-pack-downloader.exe -progress line` |
 | `-nopause` | 出错后不等待回车直接退出（脚本调用时用） | `.\osu-pack-downloader.exe -nopause` |
 
 > 出错时程序会停在「按回车键关闭窗口...」，方便双击运行时看清原因；不想停留就加 `-nopause`。
+> 输出被重定向到文件或管道时，`bar` 会自动按 `line` 处理，不会写入回车等控制字符。
 
 ## 从源码编译（可选）
 
@@ -136,7 +138,7 @@ https://packs.ppy.sh/S1813%20-%20osu%21%20Beatmap%20Pack%20%231813.zip
 - 同时最多下载 8 个文件；
 - 每个文件再分多线程下载（默认 16 片，批内文件很多时自动降到 10 片，避免连接数过多）；
 - 支持断点续传：中断后重新运行，已下载的部分不会重来（通过文件旁 `.aria2` 控制文件判断）；
-- 每 3 秒显示一次「已完成 / 下载中」的总体进度。
+- 下载期间显示一条原地刷新的进度条（整体百分比、完成数、字节、速度与预计剩余时间）；重定向输出时自动降级为周期性整行文本。
 
 ### 5. 遇到限制时的兜底方案
 

@@ -51,8 +51,12 @@ func AbsOrRelJoin(p string) (string, error) {
 }
 
 // msgf 向控制台打印带步骤前缀的信息。
+// 若正在绘制下载进度条，会先清除进度条、打印信息行，再重绘进度条，
+// 保证信息行独占一行、进度条始终停在最后一行。
 func msgf(format string, args ...any) {
 	printMu.Lock()
 	defer printMu.Unlock()
+	clearProgressLocked()
 	fmt.Printf(format+"\n", args...)
+	redrawProgressLocked()
 }

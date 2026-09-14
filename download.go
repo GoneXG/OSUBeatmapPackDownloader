@@ -266,9 +266,19 @@ func runAria2Pass(ctx context.Context, aria2Path, targetDir, cookie string, item
 		"--summary-interval=1",
 		"--console-log-level=notice",
 	}
+
+	// 进度数据来自 aria2 自己的摘要行（见 aria2progress.go 的说明）：
+	// 不启用 RPC，避免 aria2 在下载完成后不退出；拿不到摘要时退化为按任务数量统计。
 	if cookie != "" {
 		args = append(args, "--header=Cookie: "+cookie)
 	}
+
+	// 进度显示模式：-progress bar 在输出被重定向时自动降级为整行文本。
+	mode := ResolveProgressMode(ProgressMode, isStdoutTerminal())
+	if mode == progressBarMode {
+		enableProgressBar()
+	}
+	summary := &summaryProgress{}
 
 	msgf("      启动 aria2: %d 个任务 -> %s", len(items), targetDir)
 	cmd := exec.CommandContext(ctx, aria2Path, args...)
@@ -288,8 +298,8 @@ func runAria2Pass(ctx context.Context, aria2Path, targetDir, cookie string, item
 
 	var streamWg sync.WaitGroup
 	streamWg.Add(2)
-	go streamAria2Output(stdout, &streamWg)
-	go streamAria2Output(stderr, &streamWg)
+	go streamAria2Output(stdout, summary, &streamWg)
+	go streamAria2Output(stderr, summary, &streamWg)
 
 	done := make(chan struct{})
 	go func() {
@@ -297,12 +307,21 @@ func runAria2Pass(ctx context.Context, aria2Path, targetDir, cookie string, item
 		close(done)
 	}()
 
-	// 每 3 秒打印一次总体进度（统计已完成/进行中数量与下载字节数）。
+	// 下载期间持续输出总体进度：bar 模式原地刷新一行，其余模式输出整行文本。
 	progressStop := make(chan struct{})
-	go reportBatchProgress(ctx, targetDir, items, progressStop)
+	var progressWg sync.WaitGroup
+	progressWg.Add(1)
+	go func() {
+		defer progressWg.Done()
+		reportBatchProgress(ctx, targetDir, items, mode, summary, progressStop)
+	}()
 
 	waitErr := cmd.Wait()
 	close(progressStop)
+	progressWg.Wait()
+	if mode == progressBarMode {
+		disableProgressBar()
+	}
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -336,27 +355,61 @@ func controlFileExists(p string) bool {
 	return err == nil
 }
 
-// streamAria2Output 实时转发 aria2 输出中与进度/结果相关的行。
-func streamAria2Output(r io.Reader, wg *sync.WaitGroup) {
+// streamAria2Output 实时转发 aria2 输出中与结果相关的行。
+// [#gid ...] 摘要行不直接打印，只交给进度聚合，避免每秒多行刷屏。
+func streamAria2Output(r io.Reader, summary *summaryProgress, wg *sync.WaitGroup) {
 	defer wg.Done()
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// aria2 用 \r 原地刷新进度，必须按 \r 与 \n 一起切分，否则多段输出会被拼成一行。
+	scanner.Split(splitAria2Lines)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if summary != nil && summary.note(line) {
+			continue
+		}
 		if aria2LineVisible(line) {
-			msgf("    aria2 | %s", line)
+			// aria2 会给输出加 ANSI 颜色，转发前去掉，避免污染重定向后的日志文件。
+			msgf("    aria2 | %s", stripAnsiEscapes(line))
 		}
 	}
 }
 
+// ansiEscapeRe 匹配 ANSI 转义序列（颜色/光标控制等）。
+var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
+// stripAnsiEscapes 去掉字符串中的 ANSI 转义序列。
+func stripAnsiEscapes(s string) string {
+	if !strings.Contains(s, "\x1b") {
+		return s
+	}
+	return ansiEscapeRe.ReplaceAllString(s, "")
+}
+
+// splitAria2Lines 以 \r 或 \n 作为行分隔符切分 aria2 输出。
+func splitAria2Lines(data []byte, atEOF bool) (int, []byte, error) {
+	for i, b := range data {
+		if b == '\n' || b == '\r' {
+			return i + 1, data[:i], nil
+		}
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
 // aria2LineVisible 只转发完成/失败/错误等关键行，避免刷屏。
+// 进度摘要行（[#gid ...]）由进度条/进度行统一呈现，不再逐行转发。
 func aria2LineVisible(line string) bool {
 	if line == "" {
 		return false
 	}
 	l := strings.ToLower(line)
-	return strings.HasPrefix(line, "[#") ||
-		strings.Contains(l, "download complete") ||
+	return strings.Contains(l, "download complete") ||
 		strings.Contains(l, "download completed") ||
 		strings.Contains(l, "download aborted") ||
 		strings.Contains(l, "error") ||
@@ -392,11 +445,34 @@ func statBatch(targetDir string, items []aria2Item) batchStat {
 	return st
 }
 
-// reportBatchProgress 周期打印 aria2 批处理总体进度。
-// 说明：aria2 会预分配完整文件，因此不按文件字节数估算，只统计完成/进行中数量。
-func reportBatchProgress(ctx context.Context, targetDir string, items []aria2Item, stop <-chan struct{}) {
-	ticker := time.NewTicker(3 * time.Second)
+// reportBatchProgress 周期性输出批次进度。
+// bar 模式每秒原地刷新一行进度条；line 模式每 3 秒输出一行完整文本；off 模式不输出周期进度。
+// 说明：aria2 会预分配完整文件，进行中任务的字节数来自 RPC 或摘要行，已完成部分才按磁盘体积统计。
+func reportBatchProgress(ctx context.Context, targetDir string, items []aria2Item, mode progressDisplayMode, summary *summaryProgress, stop <-chan struct{}) {
+	if mode == progressOffMode {
+		return
+	}
+	interval := time.Second
+	if mode == progressLineMode {
+		interval = 3 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	emit := func() bool {
+		st := statBatch(targetDir, items)
+		snap := collectProgress(ctx, targetDir, items, st, summary)
+		if mode == progressBarMode {
+			drawProgressBar(FormatProgressBarFrame(snap, progressBarWidth))
+		} else {
+			msgf("%s", FormatProgressLine(snap))
+		}
+		return st.done >= len(items) && st.active == 0
+	}
+
+	if emit() {
+		return
+	}
 	for {
 		select {
 		case <-stop:
@@ -404,11 +480,9 @@ func reportBatchProgress(ctx context.Context, targetDir string, items []aria2Ite
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			st := statBatch(targetDir, items)
-			if st.done >= len(items) && st.active == 0 {
+			if emit() {
 				return
 			}
-			msgf("进度: 已完成 %d/%d，下载中 %d", st.done, len(items), st.active)
 		}
 	}
 }
