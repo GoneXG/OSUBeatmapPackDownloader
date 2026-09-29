@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"net"
 	"reflect"
 	"strings"
 	"testing"
@@ -36,6 +35,37 @@ func tagsOf(items []aria2Item) []string {
 	return tags
 }
 
+func packTags(packs []Pack) []string {
+	tags := make([]string, 0, len(packs))
+	for _, p := range packs {
+		tags = append(tags, p.Tag)
+	}
+	return tags
+}
+
+// fakeResolver 按「本轮能解析出真实链接的曲包」构造浏览器解析依赖。
+type fakeResolver struct {
+	foundByRound [][]string
+	roundIdx     *int
+	calls        *[][]string
+}
+
+func (f fakeResolver) resolve(_ context.Context, packs []Pack) []packResolveOutcome {
+	out := make([]packResolveOutcome, len(packs))
+	if f.calls != nil {
+		*f.calls = append(*f.calls, packTags(packs))
+	}
+	for i, p := range packs {
+		if *f.roundIdx < len(f.foundByRound) && contains(f.foundByRound[*f.roundIdx], p.Tag) {
+			out[i] = packResolveOutcome{
+				Href:  "https://packs.ppy.sh/" + p.Tag + "%20-%20Real%20Pack.7z",
+				Found: true,
+			}
+		}
+	}
+	return out
+}
+
 // assertNoInterleavedLines 断言进度输出中每条信息独占一行（不出现两条信息挤在同一行）。
 func assertNoInterleavedLines(t *testing.T, out string) {
 	t.Helper()
@@ -46,34 +76,25 @@ func assertNoInterleavedLines(t *testing.T, out string) {
 	}
 }
 
-// TestRecoverFailedPacksContinuesUntilNoProgress 覆盖「只取得一部分地址时继续下一轮」：
-// 第一轮只有部分曲包查到地址，重下成功后必须继续第二轮，且第二轮只查询仍失败的曲包
-// （未取得地址的曲包重新查询，已成功的曲包不再查询）。
+// TestRecoverFailedPacksContinuesUntilNoProgress 覆盖「只解析到一部分链接时继续下一轮」：
+// 第一轮只有部分曲包解析出链接，重下成功后必须继续第二轮，且第二轮只重查仍失败的曲包。
 func TestRecoverFailedPacksContinuesUntilNoProgress(t *testing.T) {
 	failed := recoveryItems("T1", "T2", "T3", "T4", "T5")
 
-	// 每轮能查到官方地址的曲包：第 1 轮 T1/T2，第 2 轮 T3/T4，第 3 轮 T4（T5 始终查不到）。
+	// 每轮能解析出真实链接的曲包：第 1 轮 T1/T2，第 2 轮 T3/T4，第 3 轮 T4（T5 始终解析不到）。
 	foundByRound := [][]string{{"T1", "T2"}, {"T3", "T4"}, {"T4"}}
 	// 每轮重下后仍失败的曲包：第 1 轮全部成功，第 2 轮 T4 失败，第 3 轮 T4 仍失败（无进展）。
 	stillFailedByRound := [][]string{{}, {"T4"}, {"T4"}}
 
 	var (
-		lookupCalls   []string
+		resolveCalls  [][]string
 		downloadCalls [][]string
-		promptCalls   int
 		roundIdx      int
 	)
 
 	deps := packRecoveryDeps{
-		concurrency: 1, // 顺序执行，便于断言每轮的查询集合
-		lookup: func(_ context.Context, p Pack, _ string) (string, bool, bool, error) {
-			lookupCalls = append(lookupCalls, p.Tag)
-			if roundIdx < len(foundByRound) && contains(foundByRound[roundIdx], p.Tag) {
-				return "https://osu.ppy.sh/beatmaps/packs/" + p.Tag + "/download", true, false, nil
-			}
-			return "", false, false, nil
-		},
-		download: func(_ context.Context, _ string, batch []aria2Item) []aria2Item {
+		resolve: fakeResolver{foundByRound: foundByRound, roundIdx: &roundIdx, calls: &resolveCalls}.resolve,
+		download: func(_ context.Context, batch []aria2Item) []aria2Item {
 			downloadCalls = append(downloadCalls, tagsOf(batch))
 			still := stillFailedByRound[roundIdx]
 			roundIdx++
@@ -85,20 +106,16 @@ func TestRecoverFailedPacksContinuesUntilNoProgress(t *testing.T) {
 			}
 			return out
 		},
-		promptCookie: func() (string, bool) {
-			promptCalls++
-			return "osu_session=test", false
-		},
 	}
 
 	var got []aria2Item
 	out := captureStdout(t, func() {
-		got = recoverFailedPacks(context.Background(), failed, "osu_session=seed", deps)
+		got = recoverFailedPacks(context.Background(), failed, deps)
 	})
 
-	wantLookups := []string{"T1", "T2", "T3", "T4", "T5", "T3", "T4", "T5", "T4", "T5"}
-	if !reflect.DeepEqual(lookupCalls, wantLookups) {
-		t.Fatalf("每轮查询的曲包不符合预期\n got: %v\nwant: %v", lookupCalls, wantLookups)
+	wantResolve := [][]string{{"T1", "T2", "T3", "T4", "T5"}, {"T3", "T4", "T5"}, {"T4", "T5"}}
+	if !reflect.DeepEqual(resolveCalls, wantResolve) {
+		t.Fatalf("每轮重查的曲包不符合预期\n got: %v\nwant: %v", resolveCalls, wantResolve)
 	}
 	wantDownloads := [][]string{{"T1", "T2"}, {"T3", "T4"}, {"T4"}}
 	if !reflect.DeepEqual(downloadCalls, wantDownloads) {
@@ -107,16 +124,13 @@ func TestRecoverFailedPacksContinuesUntilNoProgress(t *testing.T) {
 	if want := []string{"T4", "T5"}; !reflect.DeepEqual(tagsOf(got), want) {
 		t.Fatalf("最终失败列表不符合预期\n got: %v\nwant: %v", tagsOf(got), want)
 	}
-	if promptCalls != 0 {
-		t.Fatalf("已提供 Cookie 时不应再向用户索要，实际索要 %d 次", promptCalls)
-	}
 	assertNoInterleavedLines(t, out)
 	for _, want := range []string{
-		"第 1 轮：剩余 5 个失败曲包，开始重查官方存储地址（并发 1）...",
+		"第 1 轮：剩余 5 个失败曲包，开始经浏览器解析真实下载链接...",
 		"第 1 轮：重下 2 个，成功 2 个，剩余失败 3 个",
-		"第 2 轮：剩余 3 个失败曲包，开始重查官方存储地址（并发 1）...",
+		"第 2 轮：剩余 3 个失败曲包，开始经浏览器解析真实下载链接...",
 		"第 2 轮：重下 2 个，成功 1 个，剩余失败 2 个",
-		"第 3 轮：剩余 2 个失败曲包，开始重查官方存储地址（并发 1）...",
+		"第 3 轮：剩余 2 个失败曲包，开始经浏览器解析真实下载链接...",
 		"第 3 轮：重下 1 个，成功 0 个，剩余失败 2 个",
 		"本轮无进展，停止重试。",
 	} {
@@ -126,180 +140,122 @@ func TestRecoverFailedPacksContinuesUntilNoProgress(t *testing.T) {
 	}
 }
 
-// TestRecoverFailedPacksStopsWhenRoundMakesNoProgress 覆盖「某一轮成功数为 0 时立即停止」：
-// 不再发起新的查询与下载，返回的失败列表内容与顺序不变。
+// TestRecoverFailedPacksStopsWhenRoundMakesNoProgress 覆盖「某一轮成功数为 0 时立即停止」。
 func TestRecoverFailedPacksStopsWhenRoundMakesNoProgress(t *testing.T) {
 	failed := recoveryItems("T1", "T2", "T3")
 
 	var (
-		lookupCalls   int
+		resolveCalls  int
 		downloadCalls int
-		promptCalls   int
 	)
 
 	deps := packRecoveryDeps{
-		concurrency: 2,
-		lookup: func(_ context.Context, p Pack, _ string) (string, bool, bool, error) {
-			lookupCalls++
-			return "https://osu.ppy.sh/beatmaps/packs/" + p.Tag + "/download", true, false, nil
+		resolve: func(_ context.Context, packs []Pack) []packResolveOutcome {
+			resolveCalls++
+			out := make([]packResolveOutcome, len(packs))
+			for i, p := range packs {
+				out[i] = packResolveOutcome{Href: "https://packs.ppy.sh/" + p.Tag + "%20-%20x.zip", Found: true}
+			}
+			return out
 		},
-		download: func(_ context.Context, _ string, batch []aria2Item) []aria2Item {
+		download: func(_ context.Context, batch []aria2Item) []aria2Item {
 			downloadCalls++
 			return batch // 本批全部仍然失败
-		},
-		promptCookie: func() (string, bool) {
-			promptCalls++
-			return "osu_session=test", false
 		},
 	}
 
 	var got []aria2Item
 	captureStdout(t, func() {
-		got = recoverFailedPacks(context.Background(), failed, "osu_session=seed", deps)
+		got = recoverFailedPacks(context.Background(), failed, deps)
 	})
 
-	if lookupCalls != 3 {
-		t.Fatalf("无进展时应只查询一轮（3 个曲包），实际查询 %d 次", lookupCalls)
+	if resolveCalls != 1 {
+		t.Fatalf("无进展时应只重查一轮，实际 %d 轮", resolveCalls)
 	}
 	if downloadCalls != 1 {
 		t.Fatalf("无进展时应只重下一轮，实际重下 %d 轮", downloadCalls)
-	}
-	if promptCalls != 0 {
-		t.Fatalf("Cookie 有效时不应索要 Cookie，实际索要 %d 次", promptCalls)
 	}
 	if !reflect.DeepEqual(got, failed) {
 		t.Fatalf("无进展时失败列表应原样返回\n got: %#v\nwant: %#v", got, failed)
 	}
 }
 
-// TestRecoverFailedPacksRejectsInvalidCookieThreeTimes 覆盖 Cookie 交互：
-// 连续 3 次「页面仍要求登录」后停止循环，总尝试次数不超过 3 次；已提供的 Cookie 计入尝试次数。
-func TestRecoverFailedPacksRejectsInvalidCookieThreeTimes(t *testing.T) {
+// TestRecoverFailedPacksStopsOnNeedLogin 覆盖「解析过程中检测到未登录立即终止」：
+// 不再发起后续解析与下载，剩余曲包原样保留。
+func TestRecoverFailedPacksStopsOnNeedLogin(t *testing.T) {
 	failed := recoveryItems("T1", "T2")
 
-	cases := []struct {
-		name          string
-		initialCookie string
-		wantPrompts   int
-	}{
-		{name: "未预置 Cookie 时索要 3 次", initialCookie: "", wantPrompts: 3},
-		{name: "预置 Cookie 计入尝试次数时再索要 2 次", initialCookie: "osu_session=scraped", wantPrompts: 2},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var (
-				lookupRounds  int
-				promptCalls   int
-				downloadCalls int
-			)
-
-			deps := packRecoveryDeps{
-				concurrency: 1,
-				lookup: func(_ context.Context, _ Pack, _ string) (string, bool, bool, error) {
-					lookupRounds++
-					return "", false, true, nil // 页面仍提示需要登录
-				},
-				download: func(_ context.Context, _ string, batch []aria2Item) []aria2Item {
-					downloadCalls++
-					return batch
-				},
-				promptCookie: func() (string, bool) {
-					promptCalls++
-					return "osu_session=stale", false
-				},
-			}
-
-			var got []aria2Item
-			out := captureStdout(t, func() {
-				got = recoverFailedPacks(context.Background(), failed, tc.initialCookie, deps)
-			})
-
-			if promptCalls != tc.wantPrompts {
-				t.Fatalf("应索要 Cookie %d 次后停止，实际 %d 次", tc.wantPrompts, promptCalls)
-			}
-			// 总尝试次数（含预置 Cookie）不超过 maxCookieAttempts 次，每轮都重查全部失败曲包。
-			if lookupRounds != maxCookieAttempts*len(failed) {
-				t.Fatalf("应共尝试 %d 轮重查，实际查询 %d 次", maxCookieAttempts, lookupRounds)
-			}
-			if downloadCalls != 0 {
-				t.Fatalf("没有取得官方地址时不应重下，实际重下 %d 轮", downloadCalls)
-			}
-			if !reflect.DeepEqual(got, failed) {
-				t.Fatalf("Cookie 无效时失败列表应原样返回\n got: %#v\nwant: %#v", got, failed)
-			}
-			if !strings.Contains(out, "已连续 3 次输入的 Cookie 未生效，停止重试剩余曲包。") {
-				t.Fatalf("缺少 Cookie 尝试次数用尽提示\n实际输出:\n%s", out)
-			}
-		})
-	}
-}
-
-// TestRecoverFailedPacksStopsWhenUserSkipsCookie 覆盖用户放弃重试：不再查询、不再下载。
-func TestRecoverFailedPacksStopsWhenUserSkipsCookie(t *testing.T) {
-	failed := recoveryItems("T1", "T2")
-
-	var lookupCalls, downloadCalls int
+	var (
+		resolveCalls  int
+		downloadCalls int
+	)
 	deps := packRecoveryDeps{
-		concurrency: 2,
-		lookup: func(_ context.Context, p Pack, _ string) (string, bool, bool, error) {
-			lookupCalls++
-			return "https://osu.ppy.sh/beatmaps/packs/" + p.Tag + "/download", true, false, nil
+		resolve: func(_ context.Context, packs []Pack) []packResolveOutcome {
+			resolveCalls++
+			out := make([]packResolveOutcome, len(packs))
+			for i := range packs {
+				out[i] = packResolveOutcome{RequiresLogin: true}
+			}
+			return out
 		},
-		download: func(_ context.Context, _ string, batch []aria2Item) []aria2Item {
+		download: func(_ context.Context, batch []aria2Item) []aria2Item {
 			downloadCalls++
 			return batch
 		},
-		promptCookie: func() (string, bool) { return "", true },
 	}
 
 	var got []aria2Item
-	captureStdout(t, func() {
-		got = recoverFailedPacks(context.Background(), failed, "", deps)
+	out := captureStdout(t, func() {
+		got = recoverFailedPacks(context.Background(), failed, deps)
 	})
 
-	if lookupCalls != 0 || downloadCalls != 0 {
-		t.Fatalf("用户跳过 Cookie 后不应再查询或下载，实际查询 %d 次、重下 %d 轮", lookupCalls, downloadCalls)
-	}
-	if !reflect.DeepEqual(got, failed) {
-		t.Fatalf("跳过 Cookie 时失败列表应原样返回\n got: %#v\nwant: %#v", got, failed)
-	}
-}
-
-// TestRecoverFailedPacksStopsOnNetworkError 覆盖网络层错误：立即停止后续查询与下载，
-// 未取得官方地址的曲包保留在失败列表中。
-func TestRecoverFailedPacksStopsOnNetworkError(t *testing.T) {
-	failed := recoveryItems("T1", "T2", "T3")
-
-	var lookupCalls, downloadCalls int
-	deps := packRecoveryDeps{
-		concurrency: 1, // 顺序执行，确保网络错误后不再领取新任务
-		lookup: func(_ context.Context, p Pack, _ string) (string, bool, bool, error) {
-			lookupCalls++
-			if p.Tag == "T1" {
-				return "", false, false, &net.DNSError{Err: "no such host", Name: "osu.ppy.sh"}
-			}
-			return "https://osu.ppy.sh/beatmaps/packs/" + p.Tag + "/download", true, false, nil
-		},
-		download: func(_ context.Context, _ string, batch []aria2Item) []aria2Item {
-			downloadCalls++
-			return batch
-		},
-		promptCookie: func() (string, bool) { return "", true },
-	}
-
-	var got []aria2Item
-	captureStdout(t, func() {
-		got = recoverFailedPacks(context.Background(), failed, "osu_session=seed", deps)
-	})
-
-	if lookupCalls != 1 {
-		t.Fatalf("网络层错误后应停止发起新查询，实际查询 %d 次", lookupCalls)
+	if resolveCalls != 1 {
+		t.Fatalf("未登录时应立即终止解析，实际重查 %d 轮", resolveCalls)
 	}
 	if downloadCalls != 0 {
-		t.Fatalf("网络层错误后不应重下，实际重下 %d 轮", downloadCalls)
+		t.Fatalf("未登录时不应重下，实际重下 %d 轮", downloadCalls)
 	}
 	if !reflect.DeepEqual(got, failed) {
-		t.Fatalf("网络层错误时失败列表应原样返回\n got: %#v\nwant: %#v", got, failed)
+		t.Fatalf("未登录时失败列表应原样返回\n got: %#v\nwant: %#v", got, failed)
+	}
+	if !strings.Contains(out, "解析过程中检测到未登录") {
+		t.Fatalf("缺少未登录提示\n实际输出:\n%s", out)
+	}
+}
+
+// TestRecoverFailedPacksStopsWhenNoLinkProvided 覆盖「已登录但官网未提供下载地址」：
+// 判定为终态失败，不反复重试。
+func TestRecoverFailedPacksStopsWhenNoLinkProvided(t *testing.T) {
+	failed := recoveryItems("T1", "T2", "T3")
+
+	var resolveCalls, downloadCalls int
+	deps := packRecoveryDeps{
+		resolve: func(_ context.Context, packs []Pack) []packResolveOutcome {
+			resolveCalls++
+			out := make([]packResolveOutcome, len(packs))
+			for i := range packs {
+				out[i] = packResolveOutcome{NoLink: true}
+			}
+			return out
+		},
+		download: func(_ context.Context, batch []aria2Item) []aria2Item {
+			downloadCalls++
+			return batch
+		},
+	}
+
+	var got []aria2Item
+	out := captureStdout(t, func() {
+		got = recoverFailedPacks(context.Background(), failed, deps)
+	})
+
+	if resolveCalls != 1 || downloadCalls != 0 {
+		t.Fatalf("官网未提供下载地址时应只判定一次且不重下，实际重查 %d 次、重下 %d 轮", resolveCalls, downloadCalls)
+	}
+	if !reflect.DeepEqual(got, failed) {
+		t.Fatalf("终态失败列表应原样返回\n got: %#v\nwant: %#v", got, failed)
+	}
+	if !strings.Contains(out, "官网未提供这些曲包的下载地址") {
+		t.Fatalf("缺少终态失败提示\n实际输出:\n%s", out)
 	}
 }

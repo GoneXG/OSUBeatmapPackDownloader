@@ -1,25 +1,17 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/html"
 )
-
-// maxFetchAttempts 单次请求的最大尝试次数（含首次）。
-const maxFetchAttempts = 3
 
 // proxyURL 由 -proxy 启动参数设置；为空时使用系统/环境变量代理。
 var proxyURL string
@@ -30,6 +22,7 @@ var (
 )
 
 // getHTTPClient 返回全局复用的 HTTP 客户端（支持显式代理与系统代理，复用连接）。
+// 该客户端只用于访问不受站点拦截的 packs.ppy.sh（HEAD 连通性校验）。
 func getHTTPClient() *http.Client {
 	clientOnce.Do(func() {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -64,7 +57,7 @@ func BuildURL(catID int, mode string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("分类 %d 未配置站点类型", catID)
 	}
-	return fmt.Sprintf("https://osu.ppy.sh/beatmaps/packs?type=%s", siteType), nil
+	return fmt.Sprintf("%s/beatmaps/packs?type=%s", osuSiteOrigin, siteType), nil
 }
 
 func contains(list []string, s string) bool {
@@ -80,322 +73,245 @@ var (
 	linkRe           = regexp.MustCompile(`^https://osu\.ppy\.sh/`)
 	tagRe            = regexp.MustCompile(`^([A-Z]+)([0-9]+)$`)
 	osuPackURLPrefix = "https://packs.ppy.sh/"
+	extensionRe      = regexp.MustCompile(`(?i)\.(7z|zip)$`)
 )
 
-// PackDirectURL 根据 Tag+Name 构造 packs.ppy.sh 官方直链。
-// 实测命名规则: "https://packs.ppy.sh/<tag> - <name>.zip"（路径段使用 %20 编码）。
-func PackDirectURL(p Pack) string {
-	fileName := fmt.Sprintf("%s - %s.zip", p.Tag, p.Name)
+// ---------- 名称变体与候选构造 ----------
+
+// legacyModeLabels 把官网现代模式标签映射到 CDN 上使用的历史短名。
+// 实测：osu! -> ""（直接去掉前缀）、osu!mania -> Mania、osu!taiko -> Taiko、
+// osu!catch -> Catch the Beat（注意不是 "Catch"）。
+// 顺序敏感：必须先匹配更长的标签（osu!mania / osu!taiko / osu!catch 在 osu! 之前）。
+var legacyModeLabels = []struct{ modern, legacy string }{
+	{"osu!mania", "Mania"},
+	{"osu!taiko", "Taiko"},
+	{"osu!catch", "Catch the Beat"},
+	{"osu!", ""},
+}
+
+// linkStructure 描述一个曲包使用的「名称变体 + 扩展名」组合。
+//
+// 变体标签：
+//   - modern：官网显示名原样（如 osu!mania Beatmap Pack #111）
+//   - short ：内置派生表得到的历史短名（如 Mania Beatmap Pack #111）
+//   - learned：运行时从实测链接学到的历史短名规则（Label 替换现代名末尾 Keep 个词）
+//
+// 名称段始终按曲包逐条派生，因此同一个结构可以套用到整段区段的曲包上。
+type linkStructure struct {
+	Variant   string
+	Extension string
+	Label     string // 仅 Variant == "learned" 时使用
+	Keep      int    // 仅 Variant == "learned" 时使用
+}
+
+// shortVariantName 从官网显示名派生历史短名。
+// 覆盖不了时原样返回（这类曲包靠学习结果覆盖或浏览器解析兜底）。
+func shortVariantName(name string) string {
+	for _, m := range legacyModeLabels {
+		if !strings.HasPrefix(name, m.modern) {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(name, m.modern))
+		if m.legacy == "" {
+			return normalizeSpace(rest)
+		}
+		return normalizeSpace(m.legacy + " " + rest)
+	}
+	return name
+}
+
+// nameVariants 返回曲包名称的现代形式与历史短名。
+func nameVariants(name string) (modern, short string) {
+	modern = normalizeSpace(name)
+	return modern, shortVariantName(modern)
+}
+
+// applyLearnedLabel 按学习到的规则派生名称段：把现代名末尾 Keep 个词保留，前缀替换为 Label。
+func applyLearnedLabel(modernName, label string, keep int) string {
+	words := strings.Fields(normalizeSpace(modernName))
+	if keep <= 0 || keep > len(words) {
+		return normalizeSpace(modernName)
+	}
+	rest := strings.Join(words[len(words)-keep:], " ")
+	if strings.TrimSpace(label) == "" {
+		return rest
+	}
+	return normalizeSpace(label + " " + rest)
+}
+
+// variantNameFor 按结构派生某个曲包的名称段。
+func variantNameFor(p Pack, st linkStructure) string {
+	switch st.Variant {
+	case "short":
+		_, short := nameVariants(p.Name)
+		return short
+	case "learned":
+		return applyLearnedLabel(p.Name, st.Label, st.Keep)
+	default:
+		return normalizeSpace(p.Name)
+	}
+}
+
+// CandidateStructures 返回曲包的候选结构：2 个名称变体 × 2 个扩展名，共 4 个。
+//
+// 顺序按实测频率排列——候选顺序直接决定校验耗时（每多试一个候选就多一次 HEAD）：
+//  1. 官网名 + .zip：新区段（实测 SM175 之后、S1350 之后）
+//  2. 历史短名 + .7z：老区段（实测 S1–S1250、SM1–SM150、ST1–ST200、SC1–SC80）
+//  3. 历史短名 + .zip：过渡带（实测 S1250–S1349、SM155–SM174）
+//  4. 官网名 + .7z：实测未采到，仅作兜底
+//
+// 这样两个主要区段都只需 1 次 HEAD 即可命中。
+func CandidateStructures(p Pack) []linkStructure {
+	return []linkStructure{
+		{Variant: "modern", Extension: ".zip"},
+		{Variant: "short", Extension: ".7z"},
+		{Variant: "short", Extension: ".zip"},
+		{Variant: "modern", Extension: ".7z"},
+	}
+}
+
+// packLinkURL 按「<tag> - <名称变体><扩展名>」规则拼接官方直链。
+func packLinkURL(tag, variantName, extension string) string {
+	fileName := fmt.Sprintf("%s - %s%s", tag, variantName, extension)
 	return osuPackURLPrefix + url.PathEscape(fileName)
 }
 
-// HTTPGetWithCookie 携带 Cookie 抓取页面（T5 底层函数）。
-// 返回 (页面字节, 状态码, 错误)。状态码 >=400 不视为错误，由调用方决定。
-func HTTPGetWithCookie(ctx context.Context, pageURL, cookieHeader string) ([]byte, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+// PackLinkURL 返回该曲包在给定结构下的官方直链。
+func (p Pack) PackLinkURL(st linkStructure) string {
+	return packLinkURL(p.Tag, variantNameFor(p, st), st.Extension)
+}
+
+// linkVariantName 从已解析出的真实链接中取出名称段。
+func linkVariantName(p Pack, link string) (string, string, bool) {
+	ext := linkExtension(link)
+	if ext == "" {
+		return "", "", false
+	}
+	base := link
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	if i := strings.IndexAny(base, "?#"); i >= 0 {
+		base = base[:i]
+	}
+	if decoded, err := url.PathUnescape(base); err == nil {
+		base = decoded
+	}
+	base = strings.TrimSuffix(base, ext)
+	prefix := p.Tag + " - "
+	if !strings.HasPrefix(base, prefix) {
+		return "", "", false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(base, prefix)), ext, true
+}
+
+// deriveLearnedLabel 从「现代名」与「实测名称段」推断历史短名规则。
+// 例：现代名 "osu!mania Beatmap Pack #111"、实测 "Mania Beatmap Pack #111"
+// -> Label = "Mania"，Keep = 3（"Beatmap Pack #111"）。
+func deriveLearnedLabel(modernName, resolvedName string) (string, int, bool) {
+	m := strings.Fields(normalizeSpace(modernName))
+	r := strings.Fields(normalizeSpace(resolvedName))
+	if len(m) == 0 || len(r) == 0 {
+		return "", 0, false
+	}
+	i, j := len(m)-1, len(r)-1
+	for i >= 0 && j >= 0 && m[i] == r[j] {
+		i--
+		j--
+	}
+	keep := len(m) - (i + 1)
+	if j < 0 {
+		// 实测名称段只是现代名的后缀（没有可替换的前缀），无法学习成规则。
+		return "", 0, false
+	}
+	if keep == 0 {
+		// 现代名末尾没有可复用的固定部分（例如完全不同的命名），不学习。
+		return "", 0, false
+	}
+	return strings.Join(r[:j+1], " "), keep, true
+}
+
+// structureOfLink 从已解析出的真实链接反推该曲包使用的结构（用于学习区段的变体与扩展名）。
+func structureOfLink(p Pack, link string) (linkStructure, bool) {
+	resolved, ext, ok := linkVariantName(p, link)
+	if !ok {
+		return linkStructure{}, false
+	}
+	modern, short := nameVariants(p.Name)
+	switch resolved {
+	case modern:
+		return linkStructure{Variant: "modern", Extension: ext}, true
+	case short:
+		return linkStructure{Variant: "short", Extension: ext}, true
+	}
+	if label, keep, ok := deriveLearnedLabel(p.Name, resolved); ok {
+		return linkStructure{Variant: "learned", Extension: ext, Label: label, Keep: keep}, true
+	}
+	return linkStructure{}, false
+}
+
+// linkExtension 返回链接的扩展名（.zip / .7z），无法识别时返回空串。
+func linkExtension(link string) string {
+	trimmed := strings.TrimSpace(link)
+	if i := strings.IndexAny(trimmed, "?#"); i >= 0 {
+		trimmed = trimmed[:i]
+	}
+	m := extensionRe.FindString(trimmed)
+	if m == "" {
+		return ""
+	}
+	return strings.ToLower(m)
+}
+
+// ---------- 连通性校验（HEAD） ----------
+
+// linkCheckStatus 表示一次链接连通性校验的结果。
+type linkCheckStatus int
+
+const (
+	// linkOK 链接存在（2xx）。
+	linkOK linkCheckStatus = iota
+	// linkMissing 链接明确不存在（4xx，例如 404）。
+	linkMissing
+	// linkError 网络层错误（超时/DNS/连接被拒等），无法判定链接是否存在。
+	linkError
+)
+
+func (s linkCheckStatus) String() string {
+	switch s {
+	case linkOK:
+		return "存在"
+	case linkMissing:
+		return "不存在"
+	default:
+		return "网络错误"
+	}
+}
+
+// checkLink 用 HEAD 校验单个链接的连通性，开销最小。
+// 「不存在」与「网络层错误」严格区分：网络错误绝不能被当成「不存在」。
+func checkLink(ctx context.Context, client *http.Client, link string) (linkCheckStatus, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, link, nil)
 	if err != nil {
-		return nil, 0, err
+		return linkError, err
 	}
 	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-	if cookieHeader != "" {
-		req.Header.Set("Cookie", cookieHeader)
-	}
-
-	resp, err := getHTTPClient().Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return linkError, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-	if err != nil {
-		return nil, resp.StatusCode, err
-	}
-	return body, resp.StatusCode, nil
-}
-
-// fetchPageWithRetry 对一次 GET 做最多 3 次重试（仅网络错误/5xx/403 时）。
-// 每次重试前都会打印提示，避免长时间无输出让人误以为程序卡死。
-func fetchPageWithRetry(ctx context.Context, pageURL, cookie string) ([]byte, int, error) {
-	var lastErr error
-	lastStatus := 0
-	for attempt := 1; attempt <= maxFetchAttempts; attempt++ {
-		body, status, err := HTTPGetWithCookie(ctx, pageURL, cookie)
-		if err != nil {
-			lastErr, lastStatus = err, 0
-		} else if status == 200 {
-			return body, status, nil
-		} else {
-			lastErr, lastStatus = fmt.Errorf("HTTP %d", status), status
-			if status != 403 && status < 500 {
-				return body, status, lastErr
-			}
-		}
-		if attempt == maxFetchAttempts || ctx.Err() != nil {
-			break
-		}
-		wait := time.Duration(attempt) * 2 * time.Second
-		msgf("        请求失败（%s），%s 后重试（第 %d/%d 次）...", briefError(lastErr), wait, attempt+1, maxFetchAttempts)
-		select {
-		case <-ctx.Done():
-			return nil, lastStatus, lastErr
-		case <-time.After(wait):
-		}
-	}
-	return nil, lastStatus, lastErr
-}
-
-// ScrapeLinks 抓取一个分类（分页）下所有曲包并做模式过滤（T5）。
-func ScrapeLinks(ctx context.Context, catID int, mode, cookie string) ScrapeResult {
-	baseURL, err := BuildURL(catID, mode)
-	if err != nil {
-		return ScrapeResult{Failed: true, Reason: err.Error()}
-	}
-
-	seen := map[string]bool{}
-	var packs []Pack
-	failReason := ""
-	needsCookie := false
-	networkError := false
-
-	for pageNo := 1; pageNo <= 1000; pageNo++ {
-		u := baseURL
-		if pageNo > 1 {
-			u = baseURL + fmt.Sprintf("&page=%d", pageNo)
-		}
-		body, status, err := fetchPageWithRetry(ctx, u, cookie)
-		if err != nil {
-			if status == 404 && pageNo > 1 {
-				// 已翻到最后一页之后。
-				break
-			}
-			switch {
-			case status == 403:
-				failReason = "被站点拒绝(403)，可能需要有效 Cookie 或稍后重试"
-				needsCookie = true
-			case isNetworkFailure(err):
-				failReason = fmt.Sprintf("无法连接 %s：%s", hostOf(u), briefError(err))
-				networkError = true
-			default:
-				failReason = fmt.Sprintf("抓取 %s 失败: %v", u, err)
-			}
-			break
-		}
-		pagePacks, hasNext, parseErr := extractPacks(body, baseURL, pageNo)
-		if parseErr != nil {
-			failReason = fmt.Sprintf("解析 %s 失败: %v", u, parseErr)
-			break
-		}
-		if pageNo == 1 && len(pagePacks) == 0 {
-			// 首页能打开却没有任何曲包节点：官网对未登录访客展示登录墙时的典型表现。
-			failReason = "列表页可访问，但页面内没有曲包数据（通常表示官网要求登录后查看）"
-			needsCookie = true
-			break
-		}
-		added := 0
-		for _, p := range pagePacks {
-			if !PackMatchesMode(catID, mode, p) {
-				continue
-			}
-			if seen[p.Tag] {
-				continue
-			}
-			seen[p.Tag] = true
-			p.DirectURL = PackDirectURL(p)
-			packs = append(packs, p)
-			added++
-		}
-		msgf("  第 %d 页: 本页匹配 %d 个曲包，累计 %d 个", pageNo, added, len(packs))
-		if !hasNext || len(pagePacks) == 0 {
-			break
-		}
-	}
-
-	if failReason != "" {
-		return ScrapeResult{Failed: true, Reason: failReason, NeedsCookie: needsCookie, NetworkError: networkError}
-	}
-	if len(packs) == 0 {
-		return ScrapeResult{Failed: true, Reason: "该分类/模式下没有提取到任何曲包"}
-	}
-	return ScrapeResult{Packs: packs}
-}
-
-// isNetworkFailure 判断错误是否属于“连不上站点”层级（DNS/超时/连接被拒绝等），Cookie 无法解决这类问题。
-func isNetworkFailure(err error) bool {
-	if err == nil {
-		return false
-	}
-	var netErr net.Error
-	return errors.As(err, &netErr)
-}
-
-// briefError 把底层错误压缩成简短可读的中文原因，用于重试提示与最终提示。
-func briefError(err error) string {
-	if err == nil {
-		return "未知错误"
-	}
-	raw := err.Error()
-	lower := strings.ToLower(raw)
 	switch {
-	case strings.Contains(lower, "forbidden by its access permissions"):
-		return "连接被系统拒绝(WSAEACCES)，通常由防火墙/安全软件或受限沙箱环境导致"
-	case strings.Contains(lower, "no such host"):
-		return "域名解析失败，请检查 DNS 或网络"
-	case strings.Contains(lower, "proxyconnect") || strings.Contains(lower, "proxy"):
-		return "代理连接失败，请检查代理地址与端口"
-	case strings.Contains(lower, "connection refused"):
-		return "连接被拒绝，请检查网络或代理"
-	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded"):
-		return "连接超时，请检查网络或代理"
-	case strings.HasPrefix(raw, "HTTP "):
-		return raw
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return linkOK, nil
+	case resp.StatusCode >= 400 && resp.StatusCode < 500:
+		return linkMissing, nil
 	default:
-		if len(raw) > 160 {
-			raw = raw[:160] + "…"
-		}
-		return raw
+		return linkError, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 }
 
-// hostOf 返回 URL 的 host，解析失败时返回原字符串。
-func hostOf(u string) string {
-	if parsed, err := url.Parse(u); err == nil && parsed.Host != "" {
-		return parsed.Host
-	}
-	return u
-}
-
-// extractPacks 解析列表页 HTML，返回曲包列表与“是否有下一页”。
-func extractPacks(body []byte, baseURL string, currentPage int) ([]Pack, bool, error) {
-	doc, err := html.Parse(bytes.NewReader(body))
-	if err != nil {
-		return nil, false, err
-	}
-	var packs []Pack
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "div" && strings.Contains(" "+attr(n, "class")+" ", " js-beatmap-pack ") {
-			if tag := attr(n, "data-pack-tag"); tag != "" {
-				if p, ok := packFromNode(n, baseURL, tag); ok {
-					packs = append(packs, p)
-				}
-				// 曲包元素内不会再嵌套曲包元素。
-				return
-			}
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
-		}
-	}
-	walk(doc)
-
-	// 通过页面中的分页链接判断是否有下一页：存在页码 > 当前页 的链接即继续。
-	hasNext := false
-	for _, a := range allAnchors(doc) {
-		href := attr(a, "href")
-		if href == "" {
-			continue
-		}
-		parsed, err := url.Parse(href)
-		if err != nil {
-			continue
-		}
-		q := parsed.Query()
-		if raw := q.Get("page"); raw != "" {
-			if n, convErr := strconv.Atoi(raw); convErr == nil && n > currentPage {
-				hasNext = true
-				break
-			}
-		}
-	}
-	return packs, hasNext, nil
-}
-
-func allAnchors(doc *html.Node) []*html.Node {
-	var out []*html.Node
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "a" {
-			out = append(out, n)
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
-		}
-	}
-	walk(doc)
-	return out
-}
-
-func attr(n *html.Node, key string) string {
-	for _, a := range n.Attr {
-		if a.Key == key {
-			return a.Val
-		}
-	}
-	return ""
-}
-
-// packFromNode 从 js-beatmap-pack 节点中提取 tag/name/页面链接。
-func packFromNode(root *html.Node, baseURL, tag string) (Pack, bool) {
-	var name string
-	var pageURL string
-	var find func(*html.Node)
-	find = func(n *html.Node) {
-		if name != "" && pageURL != "" {
-			return
-		}
-		if n.Type == html.ElementNode {
-			if pageURL == "" && n.Data == "a" {
-				if href := attr(n, "href"); href != "" && strings.Contains(href, "/beatmaps/packs/"+tag) {
-					pageURL = href
-				}
-			}
-			if name == "" && n.Data == "span" && strings.Contains(" "+attr(n, "class")+" ", " beatmap-pack__name ") {
-				name = normalizeSpace(textContent(n))
-			}
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			find(c)
-		}
-	}
-	find(root)
-	if name == "" || tag == "" {
-		return Pack{}, false
-	}
-	if pageURL == "" {
-		pageURL = baseURL
-		if !strings.Contains(baseURL, "/beatmaps/packs/") {
-			base := "https://osu.ppy.sh"
-			if baseURL != "" {
-				if u, err := url.Parse(baseURL); err == nil {
-					base = u.Scheme + "://" + u.Host
-				}
-			}
-			pageURL = base + "/beatmaps/packs/" + tag
-		}
-	}
-	return Pack{Tag: tag, Name: name, PageURL: pageURL}, true
-}
-
-func textContent(n *html.Node) string {
-	var sb strings.Builder
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
-		if n.Type == html.TextNode {
-			sb.WriteString(n.Data)
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
-		}
-	}
-	walk(n)
-	return sb.String()
-}
-
-func normalizeSpace(s string) string {
-	return strings.Join(strings.Fields(s), " ")
-}
+// ---------- 模式过滤 ----------
 
 // PackMatchesMode 判断曲包是否属于所选子模式。
 // 各分类的过滤依据：
@@ -477,4 +393,55 @@ func suffixModeMatches(mode, name string) bool {
 // ValidatePageURL 校验列表页 URL 前缀（T4 验收）。
 func ValidatePageURL(u string) bool {
 	return linkRe.MatchString(u)
+}
+
+// ---------- 错误与文本工具 ----------
+
+// isNetworkFailure 判断错误是否属于“连不上站点”层级（DNS/超时/连接被拒绝等）。
+func isNetworkFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// briefError 把底层错误压缩成简短可读的中文原因。
+func briefError(err error) string {
+	if err == nil {
+		return "未知错误"
+	}
+	raw := err.Error()
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.Contains(lower, "forbidden by its access permissions"):
+		return "连接被系统拒绝(WSAEACCES)，通常由防火墙/安全软件或受限沙箱环境导致"
+	case strings.Contains(lower, "no such host"):
+		return "域名解析失败，请检查 DNS 或网络"
+	case strings.Contains(lower, "proxyconnect") || strings.Contains(lower, "proxy"):
+		return "代理连接失败，请检查代理地址与端口"
+	case strings.Contains(lower, "connection refused"):
+		return "连接被拒绝，请检查网络或代理"
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded"):
+		return "连接超时，请检查网络或代理"
+	case strings.HasPrefix(raw, "HTTP "):
+		return raw
+	default:
+		if len(raw) > 160 {
+			raw = raw[:160] + "…"
+		}
+		return raw
+	}
+}
+
+// hostOf 返回 URL 的 host，解析失败时返回原字符串。
+func hostOf(u string) string {
+	if parsed, err := url.Parse(u); err == nil && parsed.Host != "" {
+		return parsed.Host
+	}
+	return u
+}
+
+func normalizeSpace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }

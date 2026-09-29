@@ -38,8 +38,13 @@ func SanitizeName(s string) string {
 }
 
 // DownloadFileName 生成下载到本地的压缩包文件名。
+// 扩展名取自最终采用的链接：.7z 曲包保持 .7z，旧的 .zip 行为保持不变。
 func (p Pack) DownloadFileName() string {
-	return SanitizeName(fmt.Sprintf("%s - %s.zip", p.Tag, p.Name))
+	ext := linkExtension(p.DirectURL)
+	if ext == "" {
+		ext = ".zip"
+	}
+	return SanitizeName(fmt.Sprintf("%s - %s%s", p.Tag, p.Name, ext))
 }
 
 // AbsOrRelJoin 将用户输入的路径解析为相对当前目录的绝对路径。

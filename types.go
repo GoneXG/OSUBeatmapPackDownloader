@@ -1,5 +1,7 @@
 package main
 
+import "strings"
+
 // Category 对应曲包类型菜单中的一项。
 type Category struct {
 	Name  string
@@ -42,13 +44,30 @@ type CategoryChoice struct {
 	Mode  string // 无子模式时为空
 }
 
-// ScrapeResult 抓取一整个列表类型的结果。
-type ScrapeResult struct {
-	Packs  []Pack
-	Failed bool
-	Reason string
-	// NeedsCookie 表示失败原因疑似“未登录/被风控拦截”，粘贴 osu_session Cookie 后有可能解决。
-	NeedsCookie bool
-	// NetworkError 表示失败原因是连不上站点（DNS/超时/被系统拒绝等），Cookie 无法解决。
-	NetworkError bool
+// PayloadPack 是脚本（或本地列表文件）回传的单个曲包条目。
+type PayloadPack struct {
+	Tag  string `json:"tag"`  // 如 SM111
+	Name string `json:"name"` // 官网显示名，如 osu!mania Beatmap Pack #111
+	URL  string `json:"url"`  // 详情页地址
+}
+
+// PackListPayload 是脚本（或本地列表文件）回传的曲包列表载荷。
+type PackListPayload struct {
+	Protocol int           `json:"protocol"`
+	Type     string        `json:"type"`  // 站点分类参数，如 standard
+	Total    int           `json:"total"` // 条目总数，必须与 Packs 长度一致
+	Packs    []PayloadPack `json:"packs"`
+}
+
+// ToPacks 把载荷转换成内部曲包列表。
+func (p PackListPayload) ToPacks() []Pack {
+	packs := make([]Pack, 0, len(p.Packs))
+	for _, item := range p.Packs {
+		packs = append(packs, Pack{
+			Tag:     strings.TrimSpace(item.Tag),
+			Name:    normalizeSpace(item.Name),
+			PageURL: strings.TrimSpace(item.URL),
+		})
+	}
+	return packs
 }

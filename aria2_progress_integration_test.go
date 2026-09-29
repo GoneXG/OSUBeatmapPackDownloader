@@ -53,7 +53,7 @@ func TestRunAria2PassShowsEveryDownloadingPack(t *testing.T) {
 	targetDir := t.TempDir()
 	var failed []aria2Item
 	out := captureStdout(t, func() {
-		failed = runAria2Pass(context.Background(), aria2Path, targetDir, "", items)
+		failed = runAria2Pass(context.Background(), aria2Path, targetDir, items)
 	})
 
 	if len(failed) != 0 {
@@ -116,7 +116,7 @@ func TestRunAria2PassHidesPacksWithoutData(t *testing.T) {
 
 	var failed []aria2Item
 	out := captureStdout(t, func() {
-		failed = runAria2Pass(context.Background(), aria2Path, t.TempDir(), "", items)
+		failed = runAria2Pass(context.Background(), aria2Path, t.TempDir(), items)
 	})
 	if len(failed) != 0 {
 		t.Fatalf("本地下载应全部成功，实际失败 %d 个: %+v", len(failed), tagsOf(failed))

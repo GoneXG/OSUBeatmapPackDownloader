@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const backOption = "← 返回上级菜单"
@@ -16,8 +18,10 @@ var (
 	flagDownloadDir = flag.String("dir", DownloadRoot, "下载根目录")
 	flagProxy       = flag.String("proxy", "", "HTTP/HTTPS 代理，例如 http://127.0.0.1:7890；留空则使用系统代理")
 	flagNoPause     = flag.Bool("nopause", false, "结束后不等待回车（脚本/自动化调用时使用）")
-	flagLookupConc  = flag.Int("lookup-concurrency", defaultLookupConcurrency, "失败曲包链接重查的并发数（1~8）")
+	flagLookupConc  = flag.Int("lookup-concurrency", defaultLookupConcurrency, "浏览器解析与链接校验的并发数（1~8）")
 	flagProgress    = flag.String("progress", "bar", "下载进度显示方式: bar|line|off（非交互输出自动按 line 显示）")
+	flagPacksFile   = flag.String("packs", "", "本地曲包列表文件（JSON 载荷）；提供后跳过浏览器抓取")
+	flagVerifyRate  = flag.Float64("verify-rate", defaultVerifyRate, "链接抽检比例 0.01~1（默认 0.1；1 = 逐条全量校验）")
 )
 
 func main() {
@@ -41,6 +45,7 @@ func run() error {
 		DownloadRoot = filepath.Clean(*flagDownloadDir)
 	}
 	LookupConcurrency = ClampLookupConcurrency(*flagLookupConc)
+	verifyRate := ClampVerifyRate(*flagVerifyRate)
 	if mode, ok := ParseProgressMode(*flagProgress); ok {
 		ProgressMode = mode
 	} else {
@@ -59,6 +64,8 @@ func run() error {
 	if err := EnsureDir(DownloadRoot); err != nil {
 		return fmt.Errorf("无法创建 %s: %w", DownloadRoot, err)
 	}
+	// failed.txt 是「本次运行」的失败记录：开跑前清空，避免用户看到上一轮的残留。
+	_ = os.Remove(filepath.Join(UrlOutputDir, "failed.txt"))
 
 	// ---------- 选择分类（子分类菜单支持返回上级） ----------
 	choice, err := pickCategory()
@@ -78,52 +85,43 @@ func run() error {
 	}
 	msgf("列表页: %s", pageURL)
 
-	// ---------- 抓取链接：先无 Cookie 直连，失败再手动粘贴 Cookie 重爬 ----------
-	msgf("正在抓取链接，先尝试无 Cookie 直连（分页自动翻页，Ctrl+C 可中止）...")
-	cookie := ""
-	scrape := ScrapeLinks(ctx, choice.CatID, choice.Mode, "")
-	if scrape.Failed && ctx.Err() == nil {
-		msgf("      直连抓取失败: %s", scrape.Reason)
-	}
-	// 只有“疑似未登录/被拦截”时才索要 Cookie；连不上站点时 Cookie 无用，继续索要只会让人以为程序没反应。
-	if scrape.Failed && scrape.NeedsCookie && ctx.Err() == nil {
-		msgf("      将改为手动粘贴 osu_session Cookie 后重新爬取真实链接。")
-		for attempt := 1; attempt <= 3; attempt++ {
-			val, skip := ManualCookieInput()
-			if skip {
-				msgf("      已跳过 Cookie 重试。")
-				break
-			}
-			cookie = val
-			msgf("      使用 Cookie 重新抓取（第 %d 次）...", attempt)
-			scrape = ScrapeLinks(ctx, choice.CatID, choice.Mode, cookie)
-			if !scrape.Failed {
-				msgf("      带 Cookie 抓取成功。")
-				break
-			}
-			msgf("      带 Cookie 抓取仍失败: %s", scrape.Reason)
-			if !scrape.NeedsCookie {
-				// 已经变成网络层问题，再粘贴 Cookie 也没有意义。
-				break
-			}
+	// ---------- 取得曲包列表（浏览器桥接，或本地列表文件兜底） ----------
+	var (
+		srv   *bridgeServer
+		packs []Pack
+	)
+	if *flagPacksFile != "" {
+		payload, err := LoadPackListFile(*flagPacksFile)
+		if err != nil {
+			return err
+		}
+		msgf("已从本地列表文件读取 %d 个曲包：%s（跳过浏览器抓取）", len(payload.Packs), *flagPacksFile)
+		packs = payload.ToPacks()
+	} else {
+		srv, packs, err = fetchPacksViaBrowser(ctx, choice.CatID, pageURL)
+		if err != nil {
+			return err
+		}
+		if srv != nil {
+			defer srv.Close()
 		}
 	}
 
-	var scrapeFailedReason string
-	if scrape.Failed {
-		scrapeFailedReason = scrape.Reason
-		msgf("      抓取失败: %s", scrapeFailedReason)
-		if scrape.NetworkError {
-			printNetworkHelp()
+	// ---------- 按模式过滤 ----------
+	matched := make([]Pack, 0, len(packs))
+	for _, p := range packs {
+		if !PackMatchesMode(choice.CatID, choice.Mode, p) {
+			continue
 		}
-		msgf("      跳过：本次未生成下载列表。")
-		if err := writeScrapeFailure(); err != nil {
-			return err
-		}
-		SaveFailedLog(nil, scrapeFailedReason)
-		return fmt.Errorf("抓取失败，未生成下载列表")
+		matched = append(matched, p)
 	}
-	packs := scrape.Packs
+	if len(matched) != len(packs) {
+		msgf("按模式 %q 过滤后保留 %d 个曲包。", choice.Mode, len(matched))
+	}
+	packs = matched
+	if len(packs) == 0 {
+		return fmt.Errorf("该分类/模式下没有匹配的曲包")
+	}
 	msgf("抓取完成，共 %d 个曲包。", len(packs))
 	if ctx.Err() != nil {
 		return fmt.Errorf("用户中断（Ctrl+C），本次任务中止")
@@ -140,21 +138,53 @@ func run() error {
 		}
 	}
 
+	// ---------- 构造链接 + 抽检 + 定向修复 ----------
+	msgf("正在构造并校验下载链接（抽检比例 %.0f%%，并发 %d）...", verifyRate*100, LookupConcurrency)
+	report := repairPackLinks(ctx, packs, newRealRepairDeps(srv, LookupConcurrency, verifyRate))
+	if report.NeedLogin {
+		return fmt.Errorf("解析过程中检测到未登录：请在浏览器登录 osu! 后重新运行")
+	}
+	resolved := make([]Pack, 0, len(packs))
+	for _, st := range report.States {
+		if !st.Adopted() {
+			continue
+		}
+		p := st.Pack
+		p.DirectURL = st.URL
+		resolved = append(resolved, p)
+	}
+	msgf("      链接来源：逐条校验 %d 个，按区段结构推断 %d 个。", report.Verified, report.Inferred)
+	if report.Inferred > 0 {
+		msgf("      推断依据实测规律（新区段=官网名+.zip，老区段=历史短名+.7z）；如需逐条确认请加 -verify-rate 1。")
+		msgf("      推断错的链接会在下载阶段失败并自动经浏览器解析真实链接重试，不会静默留下坏文件。")
+	}
+	if len(report.Failed) > 0 {
+		msgf("      有 %d 个曲包没有任何可用链接，将记入 failed.txt。", len(report.Failed))
+	}
+	if len(resolved) == 0 {
+		if err := writeScrapeFailure(); err != nil {
+			return err
+		}
+		SaveFailedLog(nil, "没有任何曲包取得可用下载链接")
+		return fmt.Errorf("没有任何曲包取得可用下载链接")
+	}
+	packs = resolved
+
 	// ---------- 写入 urls.txt ----------
-	var links []string
+	var urls []string
 	items := make([]aria2Item, 0, len(packs))
 	for _, p := range packs {
-		links = append(links, p.DirectURL)
+		urls = append(urls, p.DirectURL)
 		items = append(items, aria2Item{URL: p.DirectURL, Pack: p})
 	}
 	urlsPath := filepath.Join(UrlOutputDir, "urls.txt")
-	if err := WriteLines(urlsPath, links); err != nil {
+	if err := WriteLines(urlsPath, urls); err != nil {
 		return fmt.Errorf("写入 %s 失败: %w", urlsPath, err)
 	}
 	if fi, err := os.Stat(urlsPath); err != nil || fi.Size() <= 10 {
 		return fmt.Errorf("%s 内容过小，疑似无有效链接", urlsPath)
 	}
-	msgf("已写入 %s（%d 行, %d 字节）", urlsPath, len(links), fileSize(urlsPath))
+	msgf("已写入 %s（%d 行, %d 字节）", urlsPath, len(urls), fileSize(urlsPath))
 
 	// ---------- 选择下载方式 ----------
 	method := AskUser(
@@ -166,6 +196,9 @@ func run() error {
 	msgf("      选择: %s", map[string]string{"1": "调用 aria2 下载", "2": "仅保留链接文件"}[method])
 
 	if method == "2" {
+		if srv != nil {
+			srv.FinishResolve()
+		}
 		msgf("      已完成：链接保存在 %s，直接退出。", urlsPath)
 		return nil
 	}
@@ -188,18 +221,132 @@ func run() error {
 	msgf("      下载目标目录（混存）: %s", targetDir)
 
 	// ---------- 执行下载 ----------
-	msgf("开始下载 %d 个曲包（自动重试一次官方存储地址）...", len(items))
-	failedItems := ExecuteDownload(ctx, aria2Path, targetDir, cookie, items)
+	msgf("开始下载 %d 个曲包（失败时经浏览器重查真实链接）...", len(items))
+	failedItems := ExecuteDownload(ctx, aria2Path, targetDir, items, srv)
 	if ctx.Err() != nil {
 		SaveFailedLog(failedItems, "")
 		return fmt.Errorf("下载被中断（Ctrl+C）：已把 %d 个未完成曲包记入 failed.txt", len(failedItems))
 	}
+	if srv != nil {
+		srv.FinishResolve()
+	}
 
 	// ---------- 保存失败日志 ----------
-	SaveFailedLog(failedItems, scrapeFailedReason)
+	SaveFailedLog(failedItems, "")
 
 	// ---------- 端到端验收 ----------
 	return e2eCheck(targetDir, len(items), len(failedItems))
+}
+
+// fetchPacksViaBrowser 拉起浏览器、等待脚本握手与曲包列表载荷。
+// 返回的桥接服务在后续解析阶段继续复用；用户中断或未检测到脚本时返回错误。
+func fetchPacksViaBrowser(ctx context.Context, catID int, pageURL string) (*bridgeServer, []Pack, error) {
+	siteType, ok := SiteTypeByCatID[catID]
+	if !ok {
+		return nil, nil, fmt.Errorf("分类 %d 未配置站点类型", catID)
+	}
+	srv, err := startBridgeServer(bridgeConfig{port: defaultBridgePort, resolveConcurrency: LookupConcurrency})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	launchURL, err := bridgeJobURL(pageURL, srv.token, srv.Port(), siteType)
+	if err != nil {
+		srv.Close()
+		return nil, nil, err
+	}
+	msgf("正在拉起浏览器并等待脚本握手（最多 %s）...", defaultHandshakeTimeout)
+	if err := openBrowserFunc(launchURL); err != nil {
+		msgf("      无法自动打开浏览器: %v", err)
+		msgf("      请手动在浏览器中打开以下地址：")
+		msgf("      %s", launchURL)
+	} else {
+		msgf("      已请求系统打开默认浏览器；若浏览器没有弹出，请手动打开：")
+		msgf("      %s", launchURL)
+	}
+
+	hs, err := srv.WaitHandshake(ctx, defaultHandshakeTimeout)
+	if err != nil {
+		srv.Close()
+		if errors.Is(err, errHandshakeIncomplete) {
+			printHandshakeIncompleteHelp()
+			return nil, nil, fmt.Errorf("桥接脚本未完成握手")
+		}
+		if errors.Is(err, errScriptNotDetected) {
+			printScriptMissingHelp()
+			return nil, nil, fmt.Errorf("未检测到桥接脚本")
+		}
+		return nil, nil, err
+	}
+	if !hs.LoggedIn {
+		srv.Close()
+		msgf("      脚本报告当前浏览器会话未登录 osu!：%s", hs.Message)
+		return nil, nil, fmt.Errorf("浏览器未登录 osu!，请登录后重新运行")
+	}
+	if hs.Message != "" {
+		// 例如「脚本未完成握手但已回传列表」：功能可用，但要提醒更新脚本。
+		msgf("      注意: %s", hs.Message)
+	}
+	msgf("      脚本已连接，正在抓取曲包列表（顺序翻页，页面右下角可看进度）...")
+
+	payload, err := srv.WaitPayload(ctx)
+	if err != nil {
+		srv.Close()
+		if errors.Is(err, errScriptHalted) {
+			return nil, nil, err
+		}
+		return nil, nil, err
+	}
+	packs := payload.ToPacks()
+	if len(packs) == 0 {
+		srv.Close()
+		return nil, nil, fmt.Errorf("脚本回传的曲包列表为空")
+	}
+	msgf("      脚本已回传 %d 个曲包。", len(packs))
+	return srv, packs, nil
+}
+
+// newRealRepairDeps 组装真实运行的修复依赖：HEAD 校验 + 经浏览器解析。
+func newRealRepairDeps(srv *bridgeServer, concurrency int, rate float64) linkRepairDeps {
+	client := getHTTPClient()
+	var resolve func(context.Context, []Pack) []packResolveOutcome
+	if srv != nil {
+		resolve = func(ctx context.Context, packs []Pack) []packResolveOutcome {
+			return srv.resolvePacks(ctx, packs)
+		}
+	}
+	return linkRepairDeps{
+		check: func(ctx context.Context, link string) (linkCheckStatus, error) {
+			// 单次校验超时可控：网络层错误会被区分出来，而不是当成「链接不存在」。
+			headCtx, cancel := context.WithTimeout(ctx, linkCheckTimeout)
+			defer cancel()
+			return checkLink(headCtx, client, link)
+		},
+		resolve:     resolve,
+		concurrency: concurrency,
+		sampleRate:  rate,
+		window:      defaultRepairWindow,
+	}
+}
+
+// linkCheckTimeout 单次 HEAD 校验的超时上限。
+const linkCheckTimeout = 15 * time.Second
+
+// ClampVerifyRate 把 -verify-rate 收敛到 0.01~1。
+func ClampVerifyRate(rate float64) float64 {
+	if rate <= 0 {
+		msgf("提示: -verify-rate=%.3f 超出范围(0.01~1)，改用 %.2f（抽检）。", rate, defaultVerifyRate)
+		return defaultVerifyRate
+	}
+	if rate > 1 {
+		msgf("提示: -verify-rate=%.3f 超出范围(0.01~1)，改用 1（逐条全量校验）。", rate)
+		return 1
+	}
+	if rate < 0.01 {
+		msgf("提示: -verify-rate=%.3f 过小，改用 0.01。", rate)
+		return 0.01
+	}
+	return rate
 }
 
 // pickCategory 选择曲包分类；带子模式时允许在子菜单“返回上级”重新选分类。
@@ -276,13 +423,6 @@ func modeSuffix(mode string) string {
 	return " / " + mode
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
-
 func fileSize(p string) int64 {
 	fi, err := os.Stat(p)
 	if err != nil {
@@ -315,9 +455,32 @@ func e2eCheck(targetDir string, total, failed int) error {
 	return fmt.Errorf("FAIL: 部分文件缺失（完成 %d，预期至少 %d）", done, expected)
 }
 
-// printNetworkHelp 打印连不上 osu.ppy.sh 时的排查建议。
+// printScriptMissingHelp 打印「未检测到脚本」时的安装与排查指引。
+func printScriptMissingHelp() {
+	msgf("      未检测到桥接脚本，本次抓取无法进行。请按顺序排查：")
+	msgf("        1) 是否已安装脚本管理器（Tampermonkey / Violentmonkey）？")
+	msgf("        2) 是否已安装桥接脚本 userscript/osu-pack-bridge.user.js？（README「脚本安装」章节有安装链接与完整代码）")
+	msgf("        3) 脚本是否处于启用状态？安装后请确认 osu.ppy.sh 页面上的脚本已开启。")
+	msgf("        4) 若浏览器未自动打开，请手动打开上面打印的地址，页面右下角会出现「osu! Pack Bridge」浮层。")
+	msgf("      安装完成、脚本启用后，重新运行本程序即可。")
+	msgf("      兜底：也可以用 -packs <本地列表文件> 跳过浏览器抓取（见 README）。")
+}
+
+// printHandshakeIncompleteHelp 打印「脚本已连上但未完成握手」时的排查指引。
+// 这种情况说明脚本确实在跟本程序通信（心跳/进度能收到），只是协议没对齐，
+// 最常见的原因是浏览器里装的是旧版脚本。
+func printHandshakeIncompleteHelp() {
+	msgf("      桥接脚本已连上本地服务（能收到它的心跳/进度），但没有完成握手。")
+	msgf("      这通常说明浏览器里安装的是旧版脚本，与本程序协议不一致。请按顺序排查：")
+	msgf("        1) 打开脚本管理器的脚本管理页，确认 osu! Pack Bridge 的版本与仓库 userscript/osu-pack-bridge.user.js 一致；")
+	msgf("        2) 在脚本管理器里对该脚本点「检查更新」（或删掉后按 README 重新安装）；")
+	msgf("        3) 更新后刷新 osu.ppy.sh 页面，再重新运行本程序。")
+	msgf("      脚本与程序都来自同一仓库；两者的协议版本必须一致（当前程序支持协议 1）。")
+}
+
+// printNetworkHelp 打印连不上站点时的排查建议。
 func printNetworkHelp() {
-	msgf("      无法访问 osu.ppy.sh，请按顺序排查：")
+	msgf("      无法访问站点，请按顺序排查：")
 	msgf("        1) 浏览器能否打开 https://osu.ppy.sh/beatmaps/packs?type=standard；打不开说明是本机网络问题；")
 	msgf("        2) 若在受限环境（IDE/沙箱内置终端、虚拟机、公司网络）里运行，请改用普通 PowerShell 或 CMD 直接运行本程序；")
 	msgf("        3) 已经能上网但程序连不上时，多半是防火墙/安全软件拦截，放行本程序即可；")

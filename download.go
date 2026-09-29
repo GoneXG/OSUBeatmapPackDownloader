@@ -11,7 +11,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -51,13 +50,13 @@ type aria2Item struct {
 }
 
 const (
-	// defaultLookupConcurrency 失败曲包链接重查的默认并发数。
+	// defaultLookupConcurrency 浏览器解析/链接校验的默认并发数。
 	defaultLookupConcurrency = 4
-	// maxLookupConcurrency 并发重查的硬上限，避免对 osu.ppy.sh 造成突发压力。
+	// maxLookupConcurrency 并发数的硬上限，避免对站点造成突发压力。
 	maxLookupConcurrency = 8
 )
 
-// LookupConcurrency 失败曲包链接重查的并发数，可由 -lookup-concurrency 调整（取值 1~maxLookupConcurrency）。
+// LookupConcurrency 浏览器解析与链接校验的并发数，可由 -lookup-concurrency 调整（取值 1~maxLookupConcurrency）。
 var LookupConcurrency = defaultLookupConcurrency
 
 // ClampLookupConcurrency 把 -lookup-concurrency 的输入收敛到 1~maxLookupConcurrency；
@@ -74,178 +73,122 @@ func ClampLookupConcurrency(n int) int {
 	return n
 }
 
-// packLookupFunc 查询单个曲包的官方存储地址，返回 (地址, 是否找到, 是否需要登录, 网络错误)。
-type packLookupFunc func(ctx context.Context, p Pack, cookie string) (string, bool, bool, error)
-
-// packLookupOutcome 单个曲包的重查结果。
-type packLookupOutcome struct {
-	href          string
-	found         bool
-	requiresLogin bool
-	netErr        error
+// packResolveOutcome 单个曲包的浏览器解析结果。
+type packResolveOutcome struct {
+	Href          string // 解析到的真实下载链接
+	Found         bool   // 是否解析到真实下载链接
+	RequiresLogin bool   // 当前会话未登录
+	NoLink        bool   // 已登录，但官网未提供下载地址（终态失败）
+	Err           error
 }
 
-// maxCookieAttempts 恢复流程中向用户索要 Cookie 的最大次数（超过即停止重试）。
-const maxCookieAttempts = 3
+// resolvePacks 经浏览器脚本解析一批曲包的真实下载链接，结果与输入一一对应。
+func (s *bridgeServer) resolvePacks(ctx context.Context, packs []Pack) []packResolveOutcome {
+	out := make([]packResolveOutcome, len(packs))
+	if len(packs) == 0 {
+		return out
+	}
+	if s == nil {
+		for i := range out {
+			out[i] = packResolveOutcome{Err: errScriptHalted}
+		}
+		return out
+	}
+	results, err := s.SubmitResolve(ctx, packs, bridgeResolveTimeout)
+	if err != nil {
+		for i := range out {
+			out[i] = packResolveOutcome{Err: err}
+		}
+		return out
+	}
+	for i, r := range results {
+		switch r.Status {
+		case resolveStatusOK:
+			out[i] = packResolveOutcome{Href: r.Href, Found: true}
+		case resolveStatusNeedLogin:
+			out[i] = packResolveOutcome{RequiresLogin: true}
+		default:
+			out[i] = packResolveOutcome{NoLink: true}
+		}
+	}
+	return out
+}
 
 // packRecoveryDeps 失败曲包恢复循环的外部依赖，便于单元测试注入假实现。
-//   - lookup：查询单个曲包的官方存储地址；
-//   - download：对给定批次执行一次 aria2 下载，返回仍失败的曲包；
-//   - promptCookie：向用户索要 Cookie，返回 (Cookie, 是否跳过)；
-//   - concurrency：重查官方地址时的并发数。
+//   - resolve：经浏览器解析一批曲包的真实下载链接（结果与输入一一对应）；
+//   - download：对给定批次执行一次 aria2 下载，返回仍失败的曲包。
 type packRecoveryDeps struct {
-	lookup       packLookupFunc
-	download     func(ctx context.Context, cookie string, items []aria2Item) []aria2Item
-	promptCookie func() (string, bool)
-	concurrency  int
+	resolve  func(ctx context.Context, packs []Pack) []packResolveOutcome
+	download func(ctx context.Context, items []aria2Item) []aria2Item
 }
 
-// lookupPackLinks 并发重查失败曲包的官方存储地址，结果按输入顺序一一对应返回。
-// 固定数量的 worker 领取任务，保证在途查询数不超过 concurrency；
-// 任一查询出现网络层错误时立即取消后续任务（已在途的查询允许自然返回），避免用户长时间干等。
-func lookupPackLinks(ctx context.Context, packs []Pack, cookie string, concurrency int, lookup packLookupFunc) []packLookupOutcome {
-	results := make([]packLookupOutcome, len(packs))
-	if len(packs) == 0 {
-		return results
-	}
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	if concurrency > len(packs) {
-		concurrency = len(packs)
-	}
-
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var (
-		next      int64 // 下一个待领取的任务下标
-		completed int64 // 已完成数量，用于进度序号
-		workers   sync.WaitGroup
-		total     = len(packs)
-	)
-	for w := 0; w < concurrency; w++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for {
-				if runCtx.Err() != nil {
-					return
-				}
-				idx := int(atomic.AddInt64(&next, 1)) - 1
-				if idx >= total || runCtx.Err() != nil {
-					return
-				}
-				href, found, requiresLogin, err := lookup(runCtx, packs[idx], cookie)
-				results[idx] = packLookupOutcome{href: href, found: found, requiresLogin: requiresLogin, netErr: err}
-				seq := atomic.AddInt64(&completed, 1)
-				// msgf 内部有互斥锁，保证整行输出不会与其他并发输出交错。
-				msgf("      查询官方存储地址 (%d/%d): %s", seq, total, packs[idx].Tag)
-				if err != nil && isNetworkFailure(err) {
-					// 网络层错误：不再发起新查询，已在途的请求允许返回。
-					cancel()
-					return
-				}
-			}
-		}()
-	}
-	workers.Wait()
-	return results
-}
-
-// recoverFailedPacks 多轮重查失败曲包的官方存储地址并用新地址重下，直到失败列表为空、
-// 某一轮毫无进展或遇到 Cookie/网络等终止条件为止；返回最终仍失败的曲包（保持输入顺序）。
+// recoverFailedPacks 多轮经浏览器重查失败曲包的真实下载链接并用新地址重下，
+// 直到失败列表为空或某一轮毫无进展为止；返回最终仍失败的曲包（保持输入顺序）。
 //
-// 推进条件（见 openspec/changes/continue-failed-pack-retry）：只有本轮有曲包被成功下载才进入下一轮，
-// 成功项永久移出失败集合，因此进度严格单调、循环必然收敛；本轮未取得官方地址的曲包保留在
-// 失败列表并进入下一轮重查，不作为终态。
-func recoverFailedPacks(ctx context.Context, failed []aria2Item, cookie string, deps packRecoveryDeps) []aria2Item {
+// 推进条件：只有本轮有曲包被成功下载才进入下一轮，成功项永久移出失败集合，
+// 因此进度严格单调、循环必然收敛；本轮未取得地址的曲包保留在失败列表并进入下一轮。
+func recoverFailedPacks(ctx context.Context, failed []aria2Item, deps packRecoveryDeps) []aria2Item {
 	if len(failed) == 0 {
 		return nil
 	}
-	if deps.concurrency < 1 {
-		deps.concurrency = 1
+	if deps.resolve == nil {
+		deps.resolve = func(_ context.Context, packs []Pack) []packResolveOutcome {
+			return make([]packResolveOutcome, len(packs))
+		}
 	}
-	if deps.promptCookie == nil {
-		deps.promptCookie = ManualCookieInput
+	if deps.download == nil {
+		deps.download = func(_ context.Context, items []aria2Item) []aria2Item { return items }
 	}
 
-	// 已有 Cookie（例如抓取阶段用户粘贴过）算作第 1 次尝试，保证总尝试次数不超过 3 次。
-	cookieAttempts := 0
-	if cookie != "" {
-		cookieAttempts = 1
-	}
-	for round := 1; len(failed) > 0; round++ {
+	for round := 1; len(failed) > 0 && round <= maxRepairRounds; round++ {
 		if ctx.Err() != nil {
 			break
 		}
-		if cookie == "" {
-			cookieAttempts++
-			if cookieAttempts > maxCookieAttempts {
-				msgf("      已连续 %d 次输入的 Cookie 未生效，停止重试剩余曲包。", maxCookieAttempts)
-				break
-			}
-			val, skip := deps.promptCookie()
-			if skip {
-				break
-			}
-			cookie = val
-		}
-
-		// 每轮都把当前仍失败的全部曲包交给重查：本轮未取得地址的曲包也要在下一轮继续尝试。
 		packs := make([]Pack, 0, len(failed))
 		for _, it := range failed {
 			packs = append(packs, it.Pack)
 		}
-		msgf("      第 %d 轮：剩余 %d 个失败曲包，开始重查官方存储地址（并发 %d）...", round, len(packs), deps.concurrency)
-		outcomes := lookupPackLinks(ctx, packs, cookie, deps.concurrency, deps.lookup)
+		msgf("      第 %d 轮：剩余 %d 个失败曲包，开始经浏览器解析真实下载链接...", round, len(packs))
+		outcomes := deps.resolve(ctx, packs)
 
-		badCookie := false
-		netBroken := false
+		needLogin := false
 		var fallbackItems []aria2Item
 		for i, out := range outcomes {
-			if out.netErr != nil {
-				netBroken = true
+			if out.RequiresLogin {
+				needLogin = true
 				continue
 			}
-			if out.requiresLogin {
-				badCookie = true
-				continue
-			}
-			if out.found && out.href != "" {
-				fallbackItems = append(fallbackItems, aria2Item{URL: out.href, Pack: packs[i]})
+			if out.Found && out.Href != "" {
+				p := packs[i]
+				p.DirectURL = out.Href
+				fallbackItems = append(fallbackItems, aria2Item{URL: out.Href, Pack: p})
 			}
 		}
 
-		if netBroken {
-			msgf("      查询官方存储地址失败: 无法连接 osu.ppy.sh（网络问题，重试 Cookie 无效）")
-			printNetworkHelp()
+		if needLogin {
+			msgf("      解析过程中检测到未登录：请在浏览器登录 osu! 后重试剩余曲包。")
 			break
 		}
 		if len(fallbackItems) == 0 {
-			if badCookie {
-				cookie = deps.rejectCookie(cookieAttempts)
-				continue
-			}
-			msgf("      Cookie 已生效，但官网未提供这些曲包的下载地址（可能已下架），本轮无进展。")
+			msgf("      已登录，但官网未提供这些曲包的下载地址（可能已下架），本轮无进展。")
 			break
 		}
 
-		msgf("      对 %d 个失败曲包使用官方存储地址重试...", len(fallbackItems))
-		stillFailed := deps.download(ctx, cookie, fallbackItems)
+		msgf("      对 %d 个失败曲包使用真实下载链接重试...", len(fallbackItems))
+		stillFailed := deps.download(ctx, fallbackItems)
 		progressed := len(fallbackItems) - len(stillFailed)
 
-		retried := map[string]bool{}
+		retried := make(map[string]bool, len(fallbackItems))
 		for _, it := range fallbackItems {
 			retried[it.Pack.Tag] = true
 		}
-		still := map[string]bool{}
+		still := make(map[string]bool, len(stillFailed))
 		for _, it := range stillFailed {
 			still[it.Pack.Tag] = true
 		}
 		remaining := make([]aria2Item, 0, len(failed))
 		for _, it := range failed {
-			// 已用官方地址重试且成功 -> 永久移出失败集合；其余保留。
+			// 已用真实链接重试且成功 -> 永久移出失败集合；其余保留。
 			if retried[it.Pack.Tag] && !still[it.Pack.Tag] {
 				continue
 			}
@@ -258,36 +201,31 @@ func recoverFailedPacks(ctx context.Context, failed []aria2Item, cookie string, 
 			msgf("      本轮无进展，停止重试。")
 			break
 		}
-		if badCookie {
-			// 仍有曲包停在登录墙：清空 Cookie，下一轮重新向用户索要。
-			cookie = deps.rejectCookie(cookieAttempts)
-		}
 	}
 	return failed
 }
 
-// rejectCookie 在判定 Cookie 未生效时提示用户重新粘贴，并清空 Cookie 供下一轮重新索要。
-func (deps packRecoveryDeps) rejectCookie(cookieAttempts int) string {
-	msgf("      Cookie 未生效：页面仍提示需要登录。请确认复制的是 osu_session 的 Value 或整段 Cookie（第 %d/%d 次）。", cookieAttempts, maxCookieAttempts)
-	return ""
-}
-
 // ExecuteDownload：调用 aria2 批量下载，返回最终失败的曲包。
-// 直链失败时尝试用 Cookie 读取官方存储地址重试，多轮进行直到剩余曲包不再减少。
-func ExecuteDownload(ctx context.Context, aria2Path, targetDir, cookie string, items []aria2Item) []aria2Item {
-	failed := runAria2Pass(ctx, aria2Path, targetDir, cookie, items)
+// 直链失败时经浏览器解析真实下载链接后重试，多轮进行直到剩余曲包不再减少。
+// srv 为空表示本次运行没有可用的浏览器桥接会话（例如本地列表文件模式）。
+func ExecuteDownload(ctx context.Context, aria2Path, targetDir string, items []aria2Item, srv *bridgeServer) []aria2Item {
+	failed := runAria2Pass(ctx, aria2Path, targetDir, items)
 	if len(failed) == 0 {
 		return nil
 	}
 
-	msgf("      有 %d 个曲包直链下载失败，尝试获取官方存储地址重试（并发 %d，多轮直到无进展）...", len(failed), LookupConcurrency)
-	failed = recoverFailedPacks(ctx, failed, cookie, packRecoveryDeps{
-		lookup: fetchRawDownloadURL,
-		download: func(ctx context.Context, cookie string, batch []aria2Item) []aria2Item {
-			return runAria2Pass(ctx, aria2Path, targetDir, cookie, batch)
+	if srv == nil {
+		msgf("      有 %d 个曲包下载失败；本次没有浏览器桥接会话，跳过真实链接重查。", len(failed))
+		return failed
+	}
+	msgf("      有 %d 个曲包直链下载失败，改为经浏览器解析真实下载链接后重试（多轮直到无进展）...", len(failed))
+	failed = recoverFailedPacks(ctx, failed, packRecoveryDeps{
+		resolve: func(ctx context.Context, packs []Pack) []packResolveOutcome {
+			return srv.resolvePacks(ctx, packs)
 		},
-		promptCookie: ManualCookieInput,
-		concurrency:  LookupConcurrency,
+		download: func(ctx context.Context, batch []aria2Item) []aria2Item {
+			return runAria2Pass(ctx, aria2Path, targetDir, batch)
+		},
 	})
 	if len(failed) > 0 {
 		msgf("      最终失败 %d 个曲包，已记录到 failed.txt。", len(failed))
@@ -308,7 +246,7 @@ func writeAria2Input(path string, items []aria2Item) error {
 	return os.WriteFile(path, []byte(sb.String()), 0o644)
 }
 
-func runAria2Pass(ctx context.Context, aria2Path, targetDir, cookie string, items []aria2Item) []aria2Item {
+func runAria2Pass(ctx context.Context, aria2Path, targetDir string, items []aria2Item) []aria2Item {
 	if len(items) == 0 {
 		return nil
 	}
@@ -342,9 +280,6 @@ func runAria2Pass(ctx context.Context, aria2Path, targetDir, cookie string, item
 
 	// 进度数据来自 aria2 自己的摘要行（见 aria2progress.go 的说明）：
 	// 不启用 RPC，避免 aria2 在下载完成后不退出；拿不到摘要时退化为按任务数量统计。
-	if cookie != "" {
-		args = append(args, "--header=Cookie: "+cookie)
-	}
 
 	// 进度显示模式：-progress bar 在输出被重定向时自动降级为整行文本。
 	mode := ResolveProgressMode(ProgressMode, isStdoutTerminal())
@@ -566,54 +501,15 @@ func reportBatchProgress(ctx context.Context, targetDir string, items []aria2Ite
 	}
 }
 
-var (
-	downloadLinkClassFirst = regexp.MustCompile(`class="beatmap-pack-download__link"[^>]*href="([^"]+)"`)
-	downloadLinkHrefFirst  = regexp.MustCompile(`href="([^"]+)"[^>]*class="beatmap-pack-download__link"`)
-)
-
-// fetchRawDownloadURL 带 Cookie 抓取 ?format=raw 页面并解析官方下载链接。
-// 返回 (官方地址, 是否找到, 页面是否仍提示需要登录, 网络错误)。
-func fetchRawDownloadURL(ctx context.Context, p Pack, cookie string) (string, bool, bool, error) {
-	if cookie == "" {
-		return "", false, false, nil
-	}
-	rawURL := strings.TrimRight(p.PageURL, "/") + "?format=raw"
-	body, status, err := HTTPGetWithCookie(ctx, rawURL, cookie)
-	if err != nil {
-		return "", false, false, err
-	}
-	if status != 200 {
-		return "", false, false, nil
-	}
-	lower := strings.ToLower(string(body))
-	// 未登录时的提示可能是英文或中文（取决于 Accept-Language）。
-	if strings.Contains(lower, "js-user-link") &&
-		(strings.Contains(lower, "signed in") || strings.Contains(lower, "登录")) {
-		return "", false, true, nil
-	}
-	var href string
-	if m := downloadLinkClassFirst.FindSubmatch(body); m != nil {
-		href = string(m[1])
-	} else if m := downloadLinkHrefFirst.FindSubmatch(body); m != nil {
-		href = string(m[1])
-	}
-	href = strings.TrimSpace(href)
-	if href == "" {
-		return "", false, false, nil
-	}
-	if strings.HasPrefix(href, "//") {
-		href = "https:" + href
-	} else if strings.HasPrefix(href, "/") {
-		href = "https://osu.ppy.sh" + href
-	}
-	return href, true, false, nil
-}
-
 // SaveFailedLog T10：失败链接写入 failed.txt；写入失败仅警告。
 func SaveFailedLog(failed []aria2Item, scrapeFailedReason string) {
 	var lines []string
 	for _, it := range failed {
-		lines = append(lines, it.Pack.DirectURL)
+		link := it.URL
+		if link == "" {
+			link = it.Pack.DirectURL
+		}
+		lines = append(lines, link)
 	}
 	if scrapeFailedReason != "" {
 		lines = append(lines, "# 抓取失败: "+scrapeFailedReason)
@@ -628,19 +524,21 @@ func SaveFailedLog(failed []aria2Item, scrapeFailedReason string) {
 	msgf("已将 %d 条失败记录写入 URL/failed.txt", len(lines))
 }
 
-// CountExpectedFiles 目标目录中实际下载完成的 zip 数量。
+// CountExpectedFiles 目标目录中实际下载完成的曲包数量（.zip 与 .7z 都计入）。
 func CountExpectedFiles(dir string) int {
-	matches, err := filepath.Glob(filepath.Join(dir, "*.zip"))
-	if err != nil {
-		return 0
-	}
 	n := 0
-	for _, m := range matches {
-		if controlFileExists(m) {
+	for _, pattern := range []string{"*.zip", "*.7z"} {
+		matches, err := filepath.Glob(filepath.Join(dir, pattern))
+		if err != nil {
 			continue
 		}
-		if fi, err := os.Stat(m); err == nil && fi.Size() > 0 {
-			n++
+		for _, m := range matches {
+			if controlFileExists(m) {
+				continue
+			}
+			if fi, err := os.Stat(m); err == nil && fi.Size() > 0 {
+				n++
+			}
 		}
 	}
 	return n
