@@ -177,6 +177,9 @@ func TestBridgeOriginPolicy(t *testing.T) {
 		if code == http.StatusOK {
 			t.Fatalf("非目标站点的来源应被拒绝，实际 %d", code)
 		}
+		if n, reason := srv.Rejections(); n != 1 || !strings.Contains(reason, "来源") {
+			t.Fatalf("被拒绝的网页来源应被计数并说明原因，实际 n=%d reason=%q", n, reason)
+		}
 	})
 
 	t.Run("来源缺失但有有效凭据", func(t *testing.T) {
@@ -187,6 +190,24 @@ func TestBridgeOriginPolicy(t *testing.T) {
 			t.Fatalf("带外请求缺少来源头时应以凭据为唯一判据，实际 %d", code)
 		}
 	})
+
+	// GM_xmlhttpRequest 的 Origin 常是扩展来源或 "null"，都不是网页来源。
+	// 这些情况必须按凭据放行，否则脚本装了也连不上（表现为「未检测到脚本」）。
+	for _, extOrigin := range []string{
+		"chrome-extension://dhdgffkkebhmkfjojejmpbldmpobfkfo",
+		"moz-extension://3c9f0c62-2f1c-4a63-9d0b-1f0b6f0a1111",
+		"null",
+	} {
+		srv := newTestBridge(t, token)
+		code, body := postBridge(t, srv, "/v1/progress", token, extOrigin,
+			bridgeProgress{Protocol: bridgeProtocolVersion, Stage: "scrape", Done: 1, Total: 2})
+		if code != http.StatusOK {
+			t.Fatalf("带有效凭据的扩展/不透明来源 %q 应被接受，实际 %d：%s", extOrigin, code, body)
+		}
+		if n, reason := srv.Rejections(); n != 0 {
+			t.Fatalf("合法请求不应被计入拒绝（%q），实际 n=%d reason=%q", extOrigin, n, reason)
+		}
+	}
 }
 
 func TestParsePackListPayloadRejectsBadInput(t *testing.T) {

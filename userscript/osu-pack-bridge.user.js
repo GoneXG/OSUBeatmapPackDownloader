@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         osu! Pack Bridge
 // @namespace    https://github.com/GoneXG/OSUBeatmapPackDownloader
-// @version      1.0.0
+// @version      1.0.1
 // @description  在本机浏览器里抓取 osu! 官方曲包列表并解析真实下载链接，经回环地址回传给 osu! 曲包下载器。
 // @author       GoneXG
 // @match        https://osu.ppy.sh/beatmaps/packs*
@@ -56,11 +56,40 @@
 
   // ---------- 与本地进程通信 ----------
 
+  // gmRequest 选择可用的带外请求实现：Tampermonkey / Violentmonkey 的
+  // GM_xmlhttpRequest，或 Greasemonkey 4+ 的 GM.xmlHttpRequest。
+  // 两者都不可用时返回 null，由 bridge 给出可读提示，而不是抛 ReferenceError。
+  const gmRequest = (() => {
+    if (typeof GM_xmlhttpRequest === 'function') return GM_xmlhttpRequest;
+    if (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') {
+      // Greasemonkey 4+ 的 GM.xmlHttpRequest 返回 Promise，可能忽略回调选项；
+      // 这里统一转成回调式，保证 bridge 的 onload/onerror 都能生效。
+      return (opts) => {
+        let ret;
+        try {
+          ret = GM.xmlHttpRequest(opts);
+        } catch (err) {
+          if (opts.onerror) opts.onerror(err);
+          return;
+        }
+        if (ret && typeof ret.then === 'function') {
+          ret.then((res) => { if (opts.onload) opts.onload(res); })
+            .catch((err) => { if (opts.onerror) opts.onerror(err); });
+        }
+      };
+    }
+    return null;
+  })();
+
   // bridge 通过带外请求访问回环桥接服务。
   // 不使用页面上下文的 fetch，避免跨源与私有网络访问（PNA）预检。
   function bridge(job, path, payload) {
     return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
+      if (!gmRequest) {
+        reject(new Error('脚本管理器未提供 GM_xmlhttpRequest：请用 Tampermonkey / Violentmonkey 安装脚本，并确认 @grant 未被改动'));
+        return;
+      }
+      gmRequest({
         method: 'POST',
         url: `http://127.0.0.1:${job.port}${path}`,
         headers: {

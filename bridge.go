@@ -46,6 +46,12 @@ const (
 	bridgeTokenHeader = "X-Bridge-Token"
 )
 
+// 桥接请求被拒绝的原因分类：用于把「脚本没装」与「脚本连上了但被拒绝」区分开。
+const (
+	rejectReasonOrigin = "来源网页不在白名单"
+	rejectReasonToken  = "凭据缺失或不匹配"
+)
+
 // 脚本解析单个曲包详情页后的结果分类。
 const (
 	resolveStatusOK        = "ok"         // 解析到真实下载链接
@@ -137,6 +143,11 @@ type bridgeServer struct {
 	lastBeat atomic.Int64 // UnixNano
 	// sawTraffic 是否收到过通过校验的脚本请求（用于区分「脚本没装」与「脚本版本不匹配」）。
 	sawTraffic atomic.Bool
+	// rejected 被拒绝的请求数；lastRejectReason 为最近一次拒绝原因，便于排查
+	// 「脚本已安装、程序却收不到任何请求」这类问题（例如凭据/来源校验把请求挡掉了）。
+	rejected         atomic.Int32
+	rejectMu         sync.Mutex
+	lastRejectReason string
 	// startAt 服务启动时刻，用于在完全没有脚本消息时判断等待是否超时。
 	startAt time.Time
 
@@ -315,18 +326,51 @@ func (s *bridgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // authorized 校验来源与一次性凭据。
-// 来源头存在时必须是目标站点；来源头缺失（带外请求常见）时以凭据为唯一判据。
+//
+// 一次性凭据是主判据：它每次运行随机生成，只经 URL 片段交给脚本、从不经过站点，
+// 因此只有本机脚本拿得到。来源（Origin）只作为针对「网页」的辅助防线。
+//
+// 带外请求（GM_xmlhttpRequest）的 Origin 并不可靠：它可能缺失，也可能不是页面源，
+// 而是浏览器扩展来源（chrome-extension://… / moz-extension://…）或在不透明上下文里的
+// "null"。这些都不是网页来源，用网页白名单去卡只会把合法脚本请求全部拒掉，表现为
+// 「脚本已装好、程序却一直等不到任何请求」。因此：
+//   - 来源是网页来源（http/https）且不在白名单 → 拒绝；
+//   - 来源缺失、为 "null"、或是扩展等非网页来源 → 以一次性凭据为准放行。
 func (s *bridgeServer) authorized(r *http.Request) bool {
-	if origin := strings.ToLower(strings.TrimSpace(r.Header.Get("Origin"))); origin != "" {
-		if !s.allowed[origin] {
-			return false
-		}
-	}
-	token := r.Header.Get(bridgeTokenHeader)
-	if token == "" {
+	origin := strings.ToLower(strings.TrimSpace(r.Header.Get("Origin")))
+	if isWebOrigin(origin) && !s.allowed[origin] {
+		s.noteRejected(rejectReasonOrigin + "：" + origin)
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(token), []byte(s.token)) == 1
+	token := strings.TrimSpace(r.Header.Get(bridgeTokenHeader))
+	if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(s.token)) != 1 {
+		s.noteRejected(rejectReasonToken)
+		return false
+	}
+	return true
+}
+
+// isWebOrigin 判断来源是否为普通网页来源（http/https）。
+// "null"、扩展来源等非网页来源返回 false。
+func isWebOrigin(origin string) bool {
+	return strings.HasPrefix(origin, "http://") || strings.HasPrefix(origin, "https://")
+}
+
+// noteRejected 记录一次被拒绝的请求（绝不记录凭据内容），并即时打印原因，
+// 避免「脚本已装但请求被拒」表现为无声的「未检测到脚本」而无法自查。
+func (s *bridgeServer) noteRejected(reason string) {
+	s.rejected.Add(1)
+	s.rejectMu.Lock()
+	s.lastRejectReason = reason
+	s.rejectMu.Unlock()
+	msgf("      [桥接] 已拒绝一个请求：%s", reason)
+}
+
+// Rejections 返回被拒绝请求的次数与最近一次原因。
+func (s *bridgeServer) Rejections() (int, string) {
+	s.rejectMu.Lock()
+	defer s.rejectMu.Unlock()
+	return int(s.rejected.Load()), s.lastRejectReason
 }
 
 // readBridgeBody 读取请求体并强制上限。
