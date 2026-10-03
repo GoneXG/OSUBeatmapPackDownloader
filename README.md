@@ -257,7 +257,7 @@ go env -w GOPROXY=https://goproxy.cn,direct
 // ==UserScript==
 // @name         osu! Pack Bridge
 // @namespace    https://github.com/GoneXG/OSUBeatmapPackDownloader
-// @version      1.0.1
+// @version      1.0.2
 // @description  在本机浏览器里抓取 osu! 官方曲包列表并解析真实下载链接，经回环地址回传给 osu! 曲包下载器。
 // @author       GoneXG
 // @match        https://osu.ppy.sh/beatmaps/packs*
@@ -288,6 +288,16 @@ go env -w GOPROXY=https://goproxy.cn,direct
   const LOGIN_MARKER = '需要 登录 才能下载';
   // 已登录时详情页出现的下载锚点类名（实测）。
   const DOWNLOAD_LINK_CLASS = 'beatmap-pack-download__link';
+
+  // 列表项与名称的类名会随 osu-web 改版（2026-09-16 起名称由 .beatmap-pack__name
+  // 移入 .beatmap-pack-item-header__name）。按优先级探测多个选择器，避免改版后
+  // 静默解析成 0 条、又被误判为「未登录」。
+  const PACK_ITEM_SELECTORS = ['div.js-beatmap-pack', 'div.beatmap-pack'];
+  const PACK_NAME_SELECTORS = [
+    '.beatmap-pack-item-header__name',
+    '.beatmap-pack__name',
+    '[class*="beatmap-pack"][class*="__name"]',
+  ];
 
   let running = false;
   let lastJobKey = '';
@@ -462,22 +472,43 @@ go env -w GOPROXY=https://goproxy.cn,direct
     return (s || '').replace(/\s+/g, ' ').trim();
   }
 
+  // packName 依次尝试多种名称选择器，返回第一个非空文本。
+  function packName(node) {
+    for (const sel of PACK_NAME_SELECTORS) {
+      const el = node.querySelector(sel);
+      if (!el) continue;
+      const name = normalizeSpace(el.textContent);
+      if (name) return name;
+    }
+    return '';
+  }
+
   // extractPacks 从列表页 HTML 中提取 tag、官网名称与详情页地址。
+  // 节点选择器与名称选择器都留了回退，官网改版时尽量不整体失效。
   function extractPacks(doc) {
     const out = [];
-    const nodes = doc.querySelectorAll('div.js-beatmap-pack');
-    nodes.forEach((node) => {
-      const tag = normalizeSpace(node.getAttribute('data-pack-tag'));
-      if (!tag) return;
-      const nameEl = node.querySelector('.beatmap-pack__name');
-      const name = nameEl ? normalizeSpace(nameEl.textContent) : '';
-      if (!name) return;
-      let href = '';
-      const link = node.querySelector(`a[href*="/beatmaps/packs/${tag}"]`);
-      if (link) href = link.getAttribute('href') || '';
-      if (!href) href = `/beatmaps/packs/${tag}`;
-      out.push({ tag, name, url: new URL(href, location.origin).href });
-    });
+    for (const itemSel of PACK_ITEM_SELECTORS) {
+      const nodes = doc.querySelectorAll(itemSel);
+      if (nodes.length === 0) continue;
+      nodes.forEach((node) => {
+        const name = packName(node);
+        if (!name) return;
+        // 详情页地址优先取列表项头部链接；拿不到就从 tag 兜底拼接
+        // （osu-web 的 packs.show 路由键就是 tag，两种写法都有效）。
+        let href = '';
+        const link = node.querySelector('a.beatmap-pack__header') || node.querySelector('a[href*="/beatmaps/packs/"]');
+        if (link) href = link.getAttribute('href') || '';
+        let tag = normalizeSpace(node.getAttribute('data-pack-tag'));
+        if (!tag && href) {
+          const m = href.match(/\/beatmaps\/packs\/([^/?#]+)/);
+          if (m) tag = normalizeSpace(decodeURIComponent(m[1]));
+        }
+        if (!tag) return;
+        if (!href) href = `/beatmaps/packs/${tag}`;
+        out.push({ tag, name, url: new URL(href, location.origin).href });
+      });
+      if (out.length > 0) break;
+    }
     return out;
   }
 
@@ -511,7 +542,12 @@ go env -w GOPROXY=https://goproxy.cn,direct
       const href = normalizeSpace(link.getAttribute('href'));
       if (href) return { status: 'ok', href: absoluteHref(href) };
     }
-    if (html.indexOf(LOGIN_MARKER) !== -1) return { status: 'need-login', href: '' };
+    // 未登录提示由 require_login 渲染为「需要 <a class="js-user-link">登录</a> 才能下载」，
+    // 整句被标签拆开，因此按「渲染后的文本」与登录锚点判定，而不是在原始 HTML 里找整句。
+    const text = normalizeSpace(doc.body ? doc.body.textContent : '');
+    if (text.indexOf(LOGIN_MARKER) !== -1 || doc.querySelector('a.js-user-link') !== null) {
+      return { status: 'need-login', href: '' };
+    }
     return { status: 'no-link', href: '' };
   }
 
@@ -536,20 +572,19 @@ go env -w GOPROXY=https://goproxy.cn,direct
       return { loggedIn: false, reason: '页面提示需要登录后才能下载曲包' };
     }
     const listHasDownload = listDoc.querySelector(`a.${DOWNLOAD_LINK_CLASS}`) !== null;
-    if (!firstPack) {
-      return { loggedIn: false, reason: '列表页没有曲包数据（通常表示需要登录）' };
-    }
+    // 调用方保证 firstPack 存在：列表页是公开的，解析不到曲包属于抓取失败，
+    // 绝不是「未登录」，因此这里绝不因缺少样本而报未登录。
     let html;
     try {
       html = await fetchText(`${firstPack.url.split('?')[0]}?format=raw`);
     } catch (err) {
       return { loggedIn: false, reason: `登录探测失败：${err.message}` };
     }
-    if (html.indexOf(LOGIN_MARKER) !== -1) {
+    const detail = analyzePackPage(html);
+    if (detail.status === 'need-login') {
       return { loggedIn: false, reason: '详情页提示需要登录后才能下载' };
     }
-    const detailHasDownload = parseHTML(html).querySelector(`a.${DOWNLOAD_LINK_CLASS}`) !== null;
-    if (!detailHasDownload && !listHasDownload) {
+    if (detail.status !== 'ok' && !listHasDownload) {
       return { loggedIn: false, reason: '页面中缺少下载链接锚点（beatmap-pack-download__link）' };
     }
     return { loggedIn: true, reason: '' };
@@ -566,6 +601,11 @@ go env -w GOPROXY=https://goproxy.cn,direct
       const doc = parseHTML(html);
       const pagePacks = extractPacks(doc);
       if (page === 1) {
+        // 列表页公开可访问（无需登录）。第 1 页解析不到任何曲包说明官网结构已变化
+        // 或该分类为空，属于抓取失败；若据此报「未登录」，用户会被误导、程序也会终止。
+        if (pagePacks.length === 0) {
+          return { failed: true, kind: 'error', message: '列表页没有解析到任何曲包：osu! 官网结构可能已更新（请更新脚本），或该分类为空' };
+        }
         const probe = await probeLogin(pagePacks[0], doc, html);
         // 先握手：本地进程要拿到登录态才会认为脚本已就绪并继续等待载荷。
         // 这里不吞掉错误——连不上本地进程时由外层统一给出可读提示。
