@@ -225,7 +225,7 @@ func run() error {
 	}
 	msgf("      下载目标目录（混存）: %s", targetDir)
 
-	// ---------- 解压会话（默认关闭；仅保留链接文件时不生效） ----------
+	// ---------- 解压会话（-unzip 显式启用时边下边解；仅保留链接文件时不生效） ----------
 	extraction := prepareExtraction(extractCfg, method, targetDir, items)
 	if extraction != nil {
 		keep := "默认保留"
@@ -251,6 +251,11 @@ func run() error {
 	}
 	if srv != nil {
 		srv.FinishResolve()
+	}
+
+	// ---------- 下载完成后询问是否解压（未用 -unzip 预先启用时） ----------
+	if extraction == nil {
+		extractStats = askExtractAfterDownload(extractCfg, targetDir, items)
 	}
 
 	// ---------- 保存失败日志 ----------
@@ -377,7 +382,7 @@ func ClampVerifyRate(rate float64) float64 {
 }
 
 // buildExtractConfig 组装解压配置：-unzip-layout 无法识别时提示并回退扁平布局。
-// 默认（-unzip 未指定）关闭解压，行为与改动前完全一致。
+// -unzip 未指定时 Enabled 为 false，解压与否改由下载完成后的询问决定（默认不解压）。
 func buildExtractConfig(enabled bool, dir, layout string, deleteAfter bool) ExtractConfig {
 	l, ok := ParseExtractLayout(layout)
 	if !ok {
@@ -389,6 +394,58 @@ func buildExtractConfig(enabled bool, dir, layout string, deleteAfter bool) Extr
 		Layout:      l,
 		DeleteAfter: deleteAfter,
 	}
+}
+
+// askExtractAfterDownload 在下载完成后询问用户是否解压本次下载的曲包。
+// 仅在未通过 -unzip 预先启用解压时调用：此时解压统一在下载结束后进行。
+// 没有任何下载完成的压缩包时不询问；用户选择不解压或无法取得有效输入时返回 nil。
+func askExtractAfterDownload(cfg ExtractConfig, targetDir string, items []aria2Item) *extractStats {
+	completed := completedArchiveItems(targetDir, items)
+	if len(completed) == 0 {
+		return nil
+	}
+	extractRoot := strings.TrimSpace(cfg.Dir)
+	if extractRoot == "" {
+		extractRoot = DefaultExtractDir(targetDir)
+	}
+	fmt.Println()
+	fmt.Printf("下载已完成，本次共 %d 个压缩包。\n", len(completed))
+	fmt.Println("是否解压这些曲包？解压出的 .osz 可直接拖进 osu! 导入。")
+	fmt.Printf("  [1] 解压到 %s（布局 %s）\n", extractRoot, cfg.Layout)
+	fmt.Println("  [2] 不解压，仅保留压缩包")
+	ans := AskUser("请选择", map[string]bool{"1": true, "2": true}, 3, "2")
+	if ans != "1" {
+		msgf("      已选择不解压，压缩包保留在 %s。", targetDir)
+		return nil
+	}
+
+	cfg.Enabled = true
+	session := prepareExtraction(cfg, "1", targetDir, completed)
+	if session == nil {
+		return nil
+	}
+	keep := "默认保留"
+	if cfg.DeleteAfter {
+		keep = "成功解压后删除"
+	}
+	msgf("      开始解压: 目标 %s，布局 %s，压缩包%s。", session.root, cfg.Layout, keep)
+	session.Start()
+	return session.Stop()
+}
+
+// completedArchiveItems 返回本次下载中已完成（存在、非空且无 .aria2 控制文件）的曲包。
+// 判定口径与解压会话一致，避免把仍在下载的预分配文件当成可解压对象。
+func completedArchiveItems(targetDir string, items []aria2Item) []aria2Item {
+	out := make([]aria2Item, 0, len(items))
+	for _, it := range items {
+		p := filepath.Join(targetDir, it.Pack.DownloadFileName())
+		fi, err := os.Stat(p)
+		if err != nil || fi.Size() == 0 || controlFileExists(p) {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
 }
 
 // pickCategory 选择曲包分类；带子模式时允许在子菜单“返回上级”重新选分类。

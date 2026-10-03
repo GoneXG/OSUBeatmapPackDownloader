@@ -20,7 +20,7 @@ osu! 官网 `osu.ppy.sh` 会按客户端指纹拦截非浏览器请求：Go、cu
 - 下载链接在有限候选空间内构造，并逐个用 HEAD 校验；校验失败的链接会按区段学习命名规则批量修复，最后还可用浏览器逐个解析兜底 调用 aria2 高并发下载，带断点续传、逐曲包实时进度；不装 aria2 也可退化为「仅保存链接」
 - 自动生成 `URL/urls.txt`（全部直链）与 `URL/failed.txt`（失败记录）
 - 脚本不可用时可用 `-packs <本地列表文件>` 离线兜底
-- 可选自动解压（`-unzip`）：边下载边解压，`.zip` 与 `.7z` 双格式，产物可直接拖进 osu!；默认关闭
+- 可选解压：下载结束后会询问是否解压本次下载的曲包（默认不解压）；加 `-unzip` 则改为边下载边解压，`.zip` 与 `.7z` 双格式，产物可直接拖进 osu!
 
 ## 快速开始（Windows）
 
@@ -77,7 +77,8 @@ osu! 官网 `osu.ppy.sh` 会按客户端指纹拦截非浏览器请求：Go、cu
 6. 询问下载方式时：
    - 输入 `1`：调用 aria2 下载（推荐）；
    - 输入 `2`：仅把链接保存到 `URL/urls.txt`，方便以后用其它工具下载；
-7. 下载完成后，到 `download/` 目录查看压缩包。
+7. 下载完成后，程序会询问**是否解压**本次下载的曲包：输入 `1` 解压（`.osz` 可直接拖进 osu!），输入 `2` 或直接回车则保留压缩包；
+8. 无论是否解压，压缩包都在 `download/` 目录，解压产物在 `download/` 同级的 `unzip/` 目录。
 
 控制台大致长这样：
 
@@ -96,7 +97,9 @@ osu! 官网 `osu.ppy.sh` 会按客户端指纹拦截非浏览器请求：Go、cu
 
 ### 5. 下载结果去哪了
 
-所有压缩包都混存在同一个目录（默认 `download/`，位于程序所在目录下）。压缩包里装的是 `.osz` 谱面文件，程序**默认不会自动解压**：请手动解压，再把 `.osz` 拖进 osu! 窗口（或直接双击 `.osz`）即可导入。想省掉手工解压，见「自动解压（可选）」。
+所有压缩包都混存在同一个目录（默认 `download/`，位于程序所在目录下）。压缩包里装的是 `.osz` 谱面文件。
+
+下载结束后程序会询问**是否解压**本次下载的曲包：选「解压」即可把 `.osz` 直接拖进 osu! 窗口（或直接双击 `.osz`）导入；选「不解压」（默认）则保留压缩包，之后手动解压也可以。想跳过这次询问、在下载过程中就边下边解，见「自动解压（可选）」。
 
 ### 6. 常用启动参数
 
@@ -108,7 +111,7 @@ osu! 官网 `osu.ppy.sh` 会按客户端指纹拦截非浏览器请求：Go、cu
 | `-verify-rate <比例>` | 链接抽检比例，`0.01`~`1`（默认 `0.1`，即逐条 HEAD 校验约十分之一的曲包，其余按区段结构推断）；`1` = 逐条全量校验 | `.\osu-pack-downloader.exe -verify-rate 1` |
 | `-packs <文件>` | 直接读本地曲包列表文件（JSON 载荷），跳过浏览器抓取 | `.\osu-pack-downloader.exe -packs packs.json` |
 | `-progress <模式>` | 下载进度显示：`bar` 原地刷新的进度块（默认）、`line` 每次输出一整块文本、`off` 不显示 | `.\osu-pack-downloader.exe -progress line` |
-| `-unzip` | 下载时自动解压压缩包（默认关闭） | `.\osu-pack-downloader.exe -unzip` |
+| `-unzip` | 下载**过程中**自动解压（跳过下载结束后的询问；默认关闭） | `.\osu-pack-downloader.exe -unzip` |
 | `-unzip-dir <路径>` | 指定解压目录（默认取下载目录同级的 `unzip` 目录） | `.\osu-pack-downloader.exe -unzip -unzip-dir "D:\unzip"` |
 | `-unzip-layout <布局>` | `flat`（默认，全部平铺）或 `per-pack`（每个曲包一个子目录） | `.\osu-pack-downloader.exe -unzip -unzip-layout per-pack` |
 | `-unzip-delete` | 解压成功后删除对应压缩包（默认保留） | `.\osu-pack-downloader.exe -unzip -unzip-delete` |
@@ -120,7 +123,9 @@ osu! 官网 `osu.ppy.sh` 会按客户端指纹拦截非浏览器请求：Go、cu
 
 ## 自动解压（可选）
 
-默认**关闭**。加上 `-unzip` 后，程序会在下载的同时把每个完成的曲包解压成可直接导入 osu! 的 `.osz`：
+不加 `-unzip` 时，程序会在**下载完成后**询问是否解压，默认不解压；这也是双击运行时的正常用法。
+
+想让程序在**下载过程中**就把每个完成的曲包解压成可直接导入 osu! 的 `.osz`，加上 `-unzip`（此时不再询问）：
 
 ```powershell
 .\osu-pack-downloader.exe -unzip
