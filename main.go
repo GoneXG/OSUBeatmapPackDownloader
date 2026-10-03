@@ -22,6 +22,10 @@ var (
 	flagProgress    = flag.String("progress", "bar", "下载进度显示方式: bar|line|off（非交互输出自动按 line 显示）")
 	flagPacksFile   = flag.String("packs", "", "本地曲包列表文件（JSON 载荷）；提供后跳过浏览器抓取")
 	flagVerifyRate  = flag.Float64("verify-rate", defaultVerifyRate, "链接抽检比例 0.01~1（默认 0.1；1 = 逐条全量校验）")
+	flagUnzip       = flag.Bool("unzip", false, "下载完成后自动解压压缩包（默认关闭）")
+	flagUnzipDir    = flag.String("unzip-dir", "", "解压目标目录（默认：下载目录的同级 unzip 目录）")
+	flagUnzipLayout = flag.String("unzip-layout", "flat", "解压布局: flat（全部平铺，默认）| per-pack（每个曲包一个子目录）")
+	flagUnzipDelete = flag.Bool("unzip-delete", false, "解压成功后删除对应压缩包（默认保留）")
 )
 
 func main() {
@@ -52,6 +56,7 @@ func run() error {
 		msgf("提示: -progress=%q 无法识别，改用 bar。可选: bar | line | off", *flagProgress)
 		ProgressMode = progressBarMode
 	}
+	extractCfg := buildExtractConfig(*flagUnzip, *flagUnzipDir, *flagUnzipLayout, *flagUnzipDelete)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -220,9 +225,26 @@ func run() error {
 	}
 	msgf("      下载目标目录（混存）: %s", targetDir)
 
+	// ---------- 解压会话（默认关闭；仅保留链接文件时不生效） ----------
+	extraction := prepareExtraction(extractCfg, method, targetDir, items)
+	if extraction != nil {
+		keep := "默认保留"
+		if extractCfg.DeleteAfter {
+			keep = "成功解压后删除"
+		}
+		msgf("      已启用自动解压: 目标 %s，布局 %s，压缩包%s。", extraction.root, extractCfg.Layout, keep)
+		extraction.Start()
+	}
+
 	// ---------- 执行下载 ----------
 	msgf("开始下载 %d 个曲包（失败时经浏览器重查真实链接）...", len(items))
 	failedItems := ExecuteDownload(ctx, aria2Path, targetDir, items, srv)
+
+	// 下载（含经浏览器重试）结束后再收尾解压，保证最后完成的压缩包也被处理。
+	var extractStats *extractStats
+	if extraction != nil {
+		extractStats = extraction.Stop()
+	}
 	if ctx.Err() != nil {
 		SaveFailedLog(failedItems, "")
 		return fmt.Errorf("下载被中断（Ctrl+C）：已把 %d 个未完成曲包记入 failed.txt", len(failedItems))
@@ -235,7 +257,7 @@ func run() error {
 	SaveFailedLog(failedItems, "")
 
 	// ---------- 端到端验收 ----------
-	return e2eCheck(targetDir, len(items), len(failedItems))
+	return e2eCheck(targetDir, len(items), len(failedItems), extractStats)
 }
 
 // fetchPacksViaBrowser 拉起浏览器、等待脚本握手与曲包列表载荷。
@@ -273,6 +295,11 @@ func fetchPacksViaBrowser(ctx context.Context, catID int, pageURL string) (*brid
 			return nil, nil, fmt.Errorf("桥接脚本未完成握手")
 		}
 		if errors.Is(err, errScriptNotDetected) {
+			if n, reason := srv.Rejections(); n > 0 {
+				msgf("      注意: 等待期间有 %d 个脚本请求被本地服务拒绝（最近原因：%s）。", n, reason)
+				printRejectedRequestHelp(reason)
+				return nil, nil, fmt.Errorf("桥接脚本请求被本地服务拒绝（%s）", reason)
+			}
 			printScriptMissingHelp()
 			return nil, nil, fmt.Errorf("未检测到桥接脚本")
 		}
@@ -347,6 +374,21 @@ func ClampVerifyRate(rate float64) float64 {
 		return 0.01
 	}
 	return rate
+}
+
+// buildExtractConfig 组装解压配置：-unzip-layout 无法识别时提示并回退扁平布局。
+// 默认（-unzip 未指定）关闭解压，行为与改动前完全一致。
+func buildExtractConfig(enabled bool, dir, layout string, deleteAfter bool) ExtractConfig {
+	l, ok := ParseExtractLayout(layout)
+	if !ok {
+		msgf("提示: -unzip-layout=%q 无法识别，改用 flat。可选: flat | per-pack", layout)
+	}
+	return ExtractConfig{
+		Enabled:     enabled,
+		Dir:         strings.TrimSpace(dir),
+		Layout:      l,
+		DeleteAfter: deleteAfter,
+	}
 }
 
 // pickCategory 选择曲包分类；带子模式时允许在子菜单“返回上级”重新选分类。
@@ -435,8 +477,10 @@ func writeScrapeFailure() error {
 	return WriteLines(filepath.Join(UrlOutputDir, "urls.txt"), []string{"# 抓取失败，无下载链接"})
 }
 
-func e2eCheck(targetDir string, total, failed int) error {
-	done := CountExpectedFiles(targetDir)
+func e2eCheck(targetDir string, total, failed int, extraction *extractStats) error {
+	// 未启用解压时维持原有口径（统计下载目录里的压缩包）；
+	// 启用解压时，压缩包存在或该曲包已成功解压都算完成（可能已删除压缩包）。
+	done := countVerifiableFiles(targetDir, extraction)
 	expected := total - failed
 	fmt.Println("\n========== 端到端验收 ==========")
 	msgf("待下载: %d, 失败: %d, 目标目录实际完成: %d", total, failed, done)
@@ -464,6 +508,16 @@ func printScriptMissingHelp() {
 	msgf("        4) 若浏览器未自动打开，请手动打开上面打印的地址，页面右下角会出现「osu! Pack Bridge」浮层。")
 	msgf("      安装完成、脚本启用后，重新运行本程序即可。")
 	msgf("      兜底：也可以用 -packs <本地列表文件> 跳过浏览器抓取（见 README）。")
+}
+
+// printRejectedRequestHelp 打印「脚本确实连上了，但请求被本地服务拒绝」时的排查指引。
+// 与「未检测到脚本」不同：这里能确定脚本已经发出请求，问题出在鉴权或版本上。
+func printRejectedRequestHelp(reason string) {
+	msgf("      桥接脚本已经连上本地服务，但请求被拒绝（%s）。请按顺序排查：", reason)
+	msgf("        1) 浏览器里是否开着上一次运行留下的旧页面？旧页面的凭据早已失效，会不断被拒；请关掉旧标签页后重试。")
+	msgf("        2) 确认脚本版本与仓库 userscript/osu-pack-bridge.user.js 一致（脚本管理器点「检查更新」或重新安装），更新后刷新页面。")
+	msgf("        3) 若刚更新过程序，请关掉所有 osu! 曲包页面再重新运行，让程序带着新凭据打开新页面。")
+	msgf("      脚本与程序都来自同一仓库；两者的协议版本与凭据必须配对。")
 }
 
 // printHandshakeIncompleteHelp 打印「脚本已连上但未完成握手」时的排查指引。

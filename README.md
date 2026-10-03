@@ -20,6 +20,7 @@ osu! 官网 `osu.ppy.sh` 会按客户端指纹拦截非浏览器请求：Go、cu
 - 下载链接在有限候选空间内构造，并逐个用 HEAD 校验；校验失败的链接会按区段学习命名规则批量修复，最后还可用浏览器逐个解析兜底 调用 aria2 高并发下载，带断点续传、逐曲包实时进度；不装 aria2 也可退化为「仅保存链接」
 - 自动生成 `URL/urls.txt`（全部直链）与 `URL/failed.txt`（失败记录）
 - 脚本不可用时可用 `-packs <本地列表文件>` 离线兜底
+- 可选自动解压（`-unzip`）：边下载边解压，`.zip` 与 `.7z` 双格式，产物可直接拖进 osu!；默认关闭
 
 ## 快速开始（Windows）
 
@@ -93,7 +94,7 @@ osu! 官网 `osu.ppy.sh` 会按客户端指纹拦截非浏览器请求：Go、cu
 
 ### 5. 下载结果去哪了
 
-所有压缩包都混存在同一个目录（默认 `download/`，位于程序所在目录下）。压缩包里装的是 `.osz` 谱面文件，程序**不会自动解压**：请手动解压，再把 `.osz` 拖进 osu! 窗口（或直接双击 `.osz`）即可导入。
+所有压缩包都混存在同一个目录（默认 `download/`，位于程序所在目录下）。压缩包里装的是 `.osz` 谱面文件，程序**默认不会自动解压**：请手动解压，再把 `.osz` 拖进 osu! 窗口（或直接双击 `.osz`）即可导入。想省掉手工解压，见「自动解压（可选）」。
 
 ### 6. 常用启动参数
 
@@ -105,11 +106,37 @@ osu! 官网 `osu.ppy.sh` 会按客户端指纹拦截非浏览器请求：Go、cu
 | `-verify-rate <比例>` | 链接抽检比例，`0.01`~`1`（默认 `0.1`，即逐条 HEAD 校验约十分之一的曲包，其余按区段结构推断）；`1` = 逐条全量校验 | `.\osu-pack-downloader.exe -verify-rate 1` |
 | `-packs <文件>` | 直接读本地曲包列表文件（JSON 载荷），跳过浏览器抓取 | `.\osu-pack-downloader.exe -packs packs.json` |
 | `-progress <模式>` | 下载进度显示：`bar` 原地刷新的进度块（默认）、`line` 每次输出一整块文本、`off` 不显示 | `.\osu-pack-downloader.exe -progress line` |
+| `-unzip` | 下载时自动解压压缩包（默认关闭） | `.\osu-pack-downloader.exe -unzip` |
+| `-unzip-dir <路径>` | 指定解压目录（默认取下载目录同级的 `unzip` 目录） | `.\osu-pack-downloader.exe -unzip -unzip-dir "D:\unzip"` |
+| `-unzip-layout <布局>` | `flat`（默认，全部平铺）或 `per-pack`（每个曲包一个子目录） | `.\osu-pack-downloader.exe -unzip -unzip-layout per-pack` |
+| `-unzip-delete` | 解压成功后删除对应压缩包（默认保留） | `.\osu-pack-downloader.exe -unzip -unzip-delete` |
 | `-nopause` | 出错后不等待回车直接退出（脚本调用时用） | `.\osu-pack-downloader.exe -nopause` |
 
 > 出错时程序会停在「按回车键关闭窗口...」，方便双击运行时看清原因；不想停留就加 `-nopause`。
 > 输出被重定向到文件或管道时，`bar` 会自动按 `line` 处理，不会写入回车等控制字符。
 > 程序源码与脚本都在仓库里，版本不匹配时程序会直接提示「协议版本不匹配」，此时更新脚本或重新编译即可。
+
+## 自动解压（可选）
+
+默认**关闭**。加上 `-unzip` 后，程序会在下载的同时把每个完成的曲包解压成可直接导入 osu! 的 `.osz`：
+
+```powershell
+.\osu-pack-downloader.exe -unzip
+```
+
+- **双格式**：`.zip` 用 Go 标准库、`.7z` 用纯 Go 库，**不需要额外安装解压工具**（除 `aria2c` 外仍只依赖单个 exe）。
+- **目标目录**：默认解压到下载目录的**同级** `unzip` 目录——默认下载目录 `.\download\` 对应 `.\unzip\`；用 `-dir "D:\osu曲包"` 时对应 `D:\unzip\`。可用 `-unzip-dir <路径>` 显式覆盖。
+- **两种布局**：
+  - `-unzip-layout flat`（默认）：所有 `.osz` 直接落在解压目录下，方便**一次全选**拖进 osu!。代价是全量解压会在同一目录产生上万个文件，部分文件管理器会变慢；
+  - `-unzip-layout per-pack`：每个曲包一个与压缩包同名的子目录，便于追溯某个 `.osz` 来自哪个曲包，目录更整洁。
+- **边下边解**：每完成一个压缩包就立即解压，不用等整批下载结束；正在下载（存在 `.aria2` 控制文件）的压缩包不会被解压。
+- **不覆盖已有文件**：目标文件已存在时跳过并计数，重复运行不会破坏你已经整理过的文件；按曲包布局下子目录已存在时会沿用该目录继续补解缺失文件。
+- **默认保留压缩包**：只有加 `-unzip-delete` 才会在**解压成功后**删除压缩包；解压失败的曲包一律保留，方便重试。
+- **进度与失败**：解压阶段显示「已处理/总数、成功、失败」，结束后列出失败曲包。
+- **安全**：会写出到解压目录之外的条目（`../` 上跳、绝对路径等）一律拒绝并记为失败，不会在解压目录之外生成任何文件。
+
+> 磁盘占用提醒：解压会与压缩包并存，短时间内接近**两倍**空间；选择 `-unzip-delete` 或稍后手工删除压缩包即可回落到一份。
+> 解压失败**不会**影响下载结果，也不会让程序整体判为失败：下载成功数、`URL/failed.txt` 都只反映下载阶段。
 
 ## 从源码编译（可选）
 
@@ -185,6 +212,7 @@ go env -w GOPROXY=https://goproxy.cn,direct
 - 每个文件再分多线程下载（默认 16 片，批内文件很多时自动降到 10 片，避免连接数过多）；
 - 支持断点续传：中断后重新运行，已下载的部分不会重来（通过文件旁 `.aria2` 控制文件判断）；
 - 下载期间显示一个原地刷新的进度块：**第一行**是整体进度（百分比、完成数/总数、总字节、总速度与整体剩余时间），**下面每个正在下载的曲包各占一行**，可以看到该曲包自身的百分比、已下载/总字节、速度与剩余时间：
+- 若启用了解压（`-unzip`），程序会在下载进行的同时用**单个**工作协程串行解压已完成的曲包（边下边解），避免与下载争抢磁盘 IO；解压统计与下载结果彼此独立。
 
 
 ### 5. 目录与文件说明
@@ -195,6 +223,7 @@ go env -w GOPROXY=https://goproxy.cn,direct
 | `URL/failed.txt` | 终态失败（没有任何可用链接）与下载失败的记录 |
 | `URL/aria2-input.txt` | 传给 aria2 的批量任务文件（含输出文件名） |
 | `download/` | 默认下载目录（可用 `-dir` 修改） |
+| `unzip/` | 启用 `-unzip` 后的默认解压目录（与下载目录同级，可用 `-unzip-dir` 修改） |
 | `tools/` | 放置 `aria2c.exe` 的位置 |
 | `userscript/osu-pack-bridge.user.js` | 桥接脚本|
 
@@ -228,7 +257,7 @@ go env -w GOPROXY=https://goproxy.cn,direct
 // ==UserScript==
 // @name         osu! Pack Bridge
 // @namespace    https://github.com/GoneXG/OSUBeatmapPackDownloader
-// @version      1.0.0
+// @version      1.0.1
 // @description  在本机浏览器里抓取 osu! 官方曲包列表并解析真实下载链接，经回环地址回传给 osu! 曲包下载器。
 // @author       GoneXG
 // @match        https://osu.ppy.sh/beatmaps/packs*
@@ -283,11 +312,40 @@ go env -w GOPROXY=https://goproxy.cn,direct
 
   // ---------- 与本地进程通信 ----------
 
+  // gmRequest 选择可用的带外请求实现：Tampermonkey / Violentmonkey 的
+  // GM_xmlhttpRequest，或 Greasemonkey 4+ 的 GM.xmlHttpRequest。
+  // 两者都不可用时返回 null，由 bridge 给出可读提示，而不是抛 ReferenceError。
+  const gmRequest = (() => {
+    if (typeof GM_xmlhttpRequest === 'function') return GM_xmlhttpRequest;
+    if (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') {
+      // Greasemonkey 4+ 的 GM.xmlHttpRequest 返回 Promise，可能忽略回调选项；
+      // 这里统一转成回调式，保证 bridge 的 onload/onerror 都能生效。
+      return (opts) => {
+        let ret;
+        try {
+          ret = GM.xmlHttpRequest(opts);
+        } catch (err) {
+          if (opts.onerror) opts.onerror(err);
+          return;
+        }
+        if (ret && typeof ret.then === 'function') {
+          ret.then((res) => { if (opts.onload) opts.onload(res); })
+            .catch((err) => { if (opts.onerror) opts.onerror(err); });
+        }
+      };
+    }
+    return null;
+  })();
+
   // bridge 通过带外请求访问回环桥接服务。
   // 不使用页面上下文的 fetch，避免跨源与私有网络访问（PNA）预检。
   function bridge(job, path, payload) {
     return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
+      if (!gmRequest) {
+        reject(new Error('脚本管理器未提供 GM_xmlhttpRequest：请用 Tampermonkey / Violentmonkey 安装脚本，并确认 @grant 未被改动'));
+        return;
+      }
+      gmRequest({
         method: 'POST',
         url: `http://127.0.0.1:${job.port}${path}`,
         headers: {
@@ -687,9 +745,16 @@ A：默认抽检 10%（`-verify-rate 0.1`），其余按区段结构推断：常
 A：会漏掉少量"孤立例外"——例如某个曲包是它所在区段里唯一改用 `.zip` 的（实测 S704），抽检抽不到就只能等下载阶段暴露。这类链接不会静默产生坏文件：下载会失败，程序随即经浏览器解析真实链接并重试，成功后才算完成；最终仍取不到的才写进 `failed.txt`。翻转带（两种结构交界）另做逐条确认，不会漏。要求零残留就用 `-verify-rate 1`。
 
 **Q：程序会自动解压或自动导入 osu! 吗？**
-Q：抓取很慢或连不上？**
+
+A：默认都不做。加 `-unzip` 可以让程序在下载时顺带解压成 `.osz`（见「自动解压（可选）」）；导入 osu! 仍然是把 `.osz` 拖进游戏窗口的手动动作——游戏侧的导入行为本工具不介入。
+
+**Q：抓取很慢或连不上？**
 
 A：抓取在浏览器里进行，慢通常是分页较多；校验与下载依赖 `packs.ppy.sh`。若网络受限，请为命令行程序配置可用的代理后重试（`-proxy`），浏览器侧仍走系统网络。
+
+**Q：启用了 `-unzip`，但有些曲包解压失败？**
+
+A：解压失败只记入解压汇总，**不影响下载结果**：失败的曲包会保留压缩包（可能是压缩包本身损坏，或用了纯 Go 库尚不支持的压缩特性），可以稍后用外部工具单独处理。下载成功数与 `URL/failed.txt` 只反映下载阶段。
 
 **Q：会下载很多数据吗？**
 
@@ -707,6 +772,7 @@ A：整类曲包数量很大（例如「常规」目前有 1800+ 个，单个几
 | 项目 | 用途 | 链接 |
 | --- | --- | --- |
 | aria2 | 多线程/多连接下载引擎。程序只通过命令行调用 `aria2c`，不内嵌或修改其代码 | <https://github.com/aria2/aria2> |
+| bodgit/sevenzip | 纯 Go 的 7z 读取库，用于解压历史 `.7z` 曲包，避免依赖外部解压工具 | <https://github.com/bodgit/sevenzip> |
 | Tampermonkey / Violentmonkey | 用户脚本管理器，负责在浏览器里运行桥接脚本 | <https://www.tampermonkey.net/> |
 | Go | 本项目的编译语言与构建工具链 | <https://go.dev> |
 
