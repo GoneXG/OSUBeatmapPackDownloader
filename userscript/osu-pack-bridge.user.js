@@ -4,6 +4,7 @@
 // @version      1.0.2
 // @description  在本机浏览器里抓取 osu! 官方曲包列表并解析真实下载链接，经回环地址回传给 osu! 曲包下载器。
 // @author       GoneXG
+// @license      MIT
 // @match        https://osu.ppy.sh/beatmaps/packs*
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1

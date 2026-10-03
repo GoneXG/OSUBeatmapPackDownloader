@@ -267,6 +267,7 @@ go env -w GOPROXY=https://goproxy.cn,direct
 // @version      1.0.2
 // @description  在本机浏览器里抓取 osu! 官方曲包列表并解析真实下载链接，经回环地址回传给 osu! 曲包下载器。
 // @author       GoneXG
+// @license      MIT
 // @match        https://osu.ppy.sh/beatmaps/packs*
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
@@ -827,11 +828,18 @@ A：整类曲包数量很大（例如「常规」目前有 1800+ 个，单个几
 
 本项目在开发与运行中引用/参考了以下项目，特此致谢：
 
-| 项目 | 用途 | 链接 |
-| --- | --- | --- |
-| aria2 | 多线程/多连接下载引擎。程序只通过命令行调用 `aria2c`，不内嵌或修改其代码 | <https://github.com/aria2/aria2> |
-| bodgit/sevenzip | 纯 Go 的 7z 读取库，用于解压历史 `.7z` 曲包，避免依赖外部解压工具 | <https://github.com/bodgit/sevenzip> |
-| Tampermonkey / Violentmonkey | 用户脚本管理器，负责在浏览器里运行桥接脚本 | <https://www.tampermonkey.net/> |
-| Go | 本项目的编译语言与构建工具链 | <https://go.dev> |
+| 项目 | 用途 | 许可证 | 链接 |
+| --- | --- | --- | --- |
+| aria2 | 多线程/多连接下载引擎。**可选、外部**程序，用户在运行时自行选装；本项目不内嵌、不修改、也不随发行物分发其代码或二进制 | GPL-2.0 | <https://github.com/aria2/aria2> |
+| bodgit/sevenzip | 纯 Go 的 7z 读取库，用于解压历史 `.7z` 曲包，避免依赖外部解压工具 | BSD-3-Clause | <https://github.com/bodgit/sevenzip> |
+| Tampermonkey / Violentmonkey | 用户脚本管理器，负责在浏览器里运行桥接脚本 | GPL-3.0 / MIT | <https://www.tampermonkey.net/> |
+| Go | 本项目的编译语言与构建工具链 | BSD-3-Clause | <https://go.dev> |
 
-> aria2 是独立开源项目（GPLv2），`aria2c.exe` 属于它自己的发行物；本工具只是把 aria2 当作外部下载程序调用。
+> aria2 是独立的开源项目（GPLv2），`aria2c.exe` 由用户自行获取。本工具只在运行时把它当作
+> 外部下载程序调用，二者是相互独立的程序；因此本项目的 MIT 许可证不受其影响。
+
+本项目**自身代码**以 MIT 许可证发布（见 [`LICENSE`](LICENSE)）。编译出的可执行文件会静态链接
+若干开源 Go 模块（MIT / BSD-3-Clause / Apache-2.0 / MPL-2.0），它们各自的版权声明、
+许可证全文，以及 MPL-2.0 组件的源代码获取方式，均记录在
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 与 [`LICENSES/`](LICENSES) 目录中。
+**再分发可执行文件时请一并附上这两项。**

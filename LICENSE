@@ -19,3 +19,19 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Third-Party Components
+
+The MIT License above applies to this project's own source code.
+
+Binaries built from this project statically link third-party open-source
+components, each governed by its own license (MIT, BSD-3-Clause, Apache-2.0
+and MPL-2.0). The complete list of components, their copyright notices,
+required attributions and full license texts are provided in
+THIRD_PARTY_NOTICES.md and the LICENSES/ directory.
+
+When redistributing a built binary, include THIRD_PARTY_NOTICES.md and the
+LICENSES/ directory so that the attribution and source-availability terms of
+those licenses are satisfied.
